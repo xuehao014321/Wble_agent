@@ -442,24 +442,32 @@ class WBLEScanner:
         await self.page.goto(TARGET_URL)
         print("\n" + "❗"*25, flush=True)
         print("🛑 登录状态检查：", flush=True)
-        print("👉 如果页面停在登录界面，请手动登录。如果是第一次，下次可能就免密了！", flush=True)
-        print("👉 脚本正在自动检测网址，登录成功后会自动开始工作，无需任何操作！", flush=True)
+        print("👉 请在浏览器里选择校区并完成登录，登录成功后脚本会自动开始工作！", flush=True)
+        print("👉 ⚠️ 温馨提示：选择校区后会弹出新标签页，属于正常现象，请在新标签页完成登录！", flush=True)
         print("❗"*25 + "\n", flush=True)
         
         for _ in range(600):
-            current_url = self.page.url
-            if "wble" in current_url and ".utar.edu.my" in current_url and "login" not in current_url and current_url.rstrip("/") != "https://wble.utar.edu.my":
-                # 必须确保页面里真正刷出了登出按钮或者课程链接，防止跳转登录页前的 0.1 秒 URL 假象
-                logout_count = await self.page.locator("a[href*='logout.php']").count()
-                course_count = await self.page.locator("a[href*='course/view.php']").count()
-                
-                if logout_count > 0 or course_count > 0:
-                    print("\n✅ 已自动检测到登录成功！", flush=True)
-                    config_mgr.set("dashboard_url", current_url)
-                    return True
+            # 关键修复：监控 context 里所有标签页，而不只是初始页
+            all_pages = self.context.pages
+            for p in all_pages:
+                current_url = p.url
+                if ("wble" in current_url and ".utar.edu.my" in current_url 
+                        and "login" not in current_url 
+                        and current_url.rstrip("/") != "https://wble.utar.edu.my"):
+                    try:
+                        logout_count = await p.locator("a[href*='logout.php']").count()
+                        course_count = await p.locator("a[href*='course/view.php']").count()
+                        if logout_count > 0 or course_count > 0:
+                            print("\n✅ 已自动检测到登录成功！", flush=True)
+                            config_mgr.set("dashboard_url", current_url)
+                            self.page = p  # 切换主控页面到登录成功的那个标签页
+                            return True
+                    except Exception:
+                        pass
             await asyncio.sleep(1)
         print("⚠️ 登录检测超时，请重试。", flush=True)
         return False
+
         
     async def run_scan_cycle(self):
         state_db = config_mgr.state
