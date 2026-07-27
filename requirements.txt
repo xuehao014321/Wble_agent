@@ -1,0 +1,7 @@
+langchain-openai
+langchain-google-genai
+langchain
+playwright
+PyQt6
+beautifulsoup4
+html2text
