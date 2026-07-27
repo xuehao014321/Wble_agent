@@ -449,9 +449,14 @@ class WBLEScanner:
         for _ in range(600):
             current_url = self.page.url
             if "wble" in current_url and ".utar.edu.my" in current_url and "login" not in current_url and current_url.rstrip("/") != "https://wble.utar.edu.my":
-                print("\n✅ 已自动检测到登录成功！", flush=True)
-                config_mgr.set("dashboard_url", current_url)
-                return True
+                # 必须确保页面里真正刷出了登出按钮或者课程链接，防止跳转登录页前的 0.1 秒 URL 假象
+                logout_count = await self.page.locator("a[href*='logout.php']").count()
+                course_count = await self.page.locator("a[href*='course/view.php']").count()
+                
+                if logout_count > 0 or course_count > 0:
+                    print("\n✅ 已自动检测到登录成功！", flush=True)
+                    config_mgr.set("dashboard_url", current_url)
+                    return True
             await asyncio.sleep(1)
         print("⚠️ 登录检测超时，请重试。", flush=True)
         return False
