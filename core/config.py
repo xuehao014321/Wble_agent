@@ -7,7 +7,8 @@ STATE_FILE = "wble_state.json"
 
 DEFAULT_CONFIG = {
     "api_keys": {
-        "azure_github": "",
+        "openai": "",
+        "groq": "",
         "gemini": "",
         "kimi": ""
     },

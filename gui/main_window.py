@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import asyncio
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
@@ -55,12 +56,13 @@ class MainWindow(QMainWindow):
         left_panel = QVBoxLayout()
         left_panel.setSpacing(10)
         
-        lbl_courses = QLabel("Courses Monitored")
+        lbl_courses = QLabel("Courses Monitored\n(Double-click to open folder)")
         lbl_courses.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f;")
         left_panel.addWidget(lbl_courses)
         
         self.course_list = QListWidget()
         self.refresh_course_list()
+        self.course_list.itemDoubleClicked.connect(self.open_course_folder)
         left_panel.addWidget(self.course_list)
         
         btn_remove_course = QPushButton("Remove Selected")
@@ -158,6 +160,26 @@ class MainWindow(QMainWindow):
         github_layout.addWidget(btn_get_github)
         github_layout.addWidget(btn_help_github)
         right_panel.addLayout(github_layout)
+        
+        lbl_groq = QLabel("Groq API Key (Fast & Free)")
+        lbl_groq.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 10px; font-weight: bold;")
+        right_panel.addWidget(lbl_groq)
+        groq_layout = QHBoxLayout()
+        groq_layout.setSpacing(6)
+        self.in_groq = QLineEdit(config_mgr.get("api_keys", {}).get("groq", ""))
+        self.in_groq.setEchoMode(QLineEdit.EchoMode.Password)
+        btn_get_groq = QPushButton("Get Key")
+        btn_get_groq.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://console.groq.com/keys")))
+        btn_help_groq = self.create_help_btn(
+            "Groq 获取教程与规则", 
+            "教程: 点击 [Get Key] 登录 Groq Console -> 侧边栏进入 [API Keys] -> 点击 [Create API Key]。\n\n"
+            "💡 免费规则: Groq 提供非常快速且免费的 Llama 3 接口，极度推荐！\n\n"
+            "🔑 最后，复制生成的以 gsk_ 开头的密钥粘贴于此。"
+        )
+        groq_layout.addWidget(self.in_groq)
+        groq_layout.addWidget(btn_get_groq)
+        groq_layout.addWidget(btn_help_groq)
+        right_panel.addLayout(groq_layout)
         
         lbl_kimi = QLabel("Kimi API Key (Fallback 1)")
         lbl_kimi.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 10px; font-weight: bold;")
@@ -329,6 +351,17 @@ class MainWindow(QMainWindow):
             self.refresh_course_list()
             print(f"🗑️ 已将课程移出监控列表: {course}")
 
+    def open_course_folder(self, item):
+        course = item.text()
+        safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
+        base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
+        course_dir = os.path.join(base_dir, safe_course_name)
+        if os.path.exists(course_dir):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(course_dir))
+            print(f"📂 已在资源管理器中打开: {course}")
+        else:
+            QMessageBox.information(self, "文件夹不存在", "该课程的文件夹尚未建立，可能是还没下载过任何文件。")
+
     def browse_path(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择下载保存路径")
         if dir_path:
@@ -336,12 +369,13 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         openai_key = self.in_openai.text().strip()
+        groq_key = self.in_groq.text().strip()
         kimi_key = self.in_kimi.text().strip()
         gemini_key = self.in_gemini.text().strip()
         
         # Validation
-        if not (openai_key or kimi_key or gemini_key):
-            QMessageBox.warning(self, "缺少 API 密钥", "【必填】请在右侧至少填写一个 AI 引擎的 API 密钥 (GitHub / Kimi / Gemini)！\n否则软件无法为你自动总结课件。")
+        if not (openai_key or groq_key or kimi_key or gemini_key):
+            QMessageBox.warning(self, "缺少 API 密钥", "【必填】请在右侧至少填写一个 AI 引擎的 API 密钥 (GitHub / Groq / Kimi / Gemini)！\n否则软件无法为你自动总结课件。")
             return False
             
         if openai_key and not (openai_key.startswith("github_pat_") or openai_key.startswith("ghp_")):
@@ -352,6 +386,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "格式错误", "Kimi API Key 格式似乎不对！\n正常应该以 sk- 开头，请参考教程重新获取。")
             return False
             
+        if groq_key and not groq_key.startswith("gsk_"):
+            QMessageBox.warning(self, "格式错误", "Groq API Key 格式似乎不对！\n正常应该以 gsk_ 开头，请参考教程重新获取。")
+            return False
+            
         if gemini_key and not (gemini_key.startswith("AIza") or gemini_key.startswith("AQ")):
             QMessageBox.warning(self, "格式错误", "Gemini API Key 格式似乎不对！\n正常应该以 AIza 或 AQ 开头，请参考教程重新获取。")
             return False
@@ -359,6 +397,7 @@ class MainWindow(QMainWindow):
         config_mgr.set("download_dir", self.in_path.text())
         keys = config_mgr.get("api_keys", {})
         keys["openai"] = openai_key
+        keys["groq"] = groq_key
         keys["kimi"] = kimi_key
         keys["gemini"] = gemini_key
         config_mgr.set("api_keys", keys)
@@ -384,7 +423,7 @@ class MainWindow(QMainWindow):
         
     def force_scan(self):
         keys = config_mgr.get("api_keys", {})
-        if not (keys.get("openai") or keys.get("kimi") or keys.get("gemini")):
+        if not (keys.get("openai") or keys.get("groq") or keys.get("kimi") or keys.get("gemini")):
             QMessageBox.warning(self, "Action Required", "请先配置并保存至少一个 AI 引擎的 API 密钥后，再启动扫描。")
             return
 

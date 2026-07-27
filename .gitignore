@@ -33,4 +33,6 @@ venv.bak/
 chrome_data/
 WBLE_Downloads/
 config.json
+wble_config.json
+wble_state.json
 *.log

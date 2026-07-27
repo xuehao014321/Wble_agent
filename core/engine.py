@@ -71,7 +71,7 @@ async def extract_course_links(page):
 async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
     """
     大模型高可用轮询系统 (Fallback)
-    优先级: 1. Azure GPT-4o (每日免费50次) -> 2. 用户自备 Kimi -> 3. 用户自备 Gemini
+    优先级: 1. Azure GPT-4o -> 2. Groq -> 3. Gemini -> 4. Kimi
     """
     # 1. Azure OpenAI (GitHub Models 白嫖)
     try:
@@ -79,49 +79,65 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
         if github_key:
             print("   🤖 [AI 引擎] 尝试主引擎: GitHub Models GPT-4o (User Token)...", flush=True)
             llm = ChatOpenAI(model="gpt-4o", api_key=github_key, base_url="https://models.inference.ai.azure.com", temperature=0.1)
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
         else:
             raise ValueError("未配置 GitHub Token，自动回退到下一个可用引擎")
-        chain = prompt_template | llm
-        res = await chain.ainvoke(kwargs_dict)
-        return res.content
     except Exception as e:
         print(f"      ⚠️ Azure 主引擎已枯竭 (触发限制): {type(e).__name__}", flush=True)
 
-    # 2. Gemini (备用引擎，不花钱)
+    # 2. Groq (免费高速引擎)
     try:
-        print("   🤖 [AI 引擎] 启动备用引擎: Gemini 3.5 Flash...", flush=True)
-        from google import genai
+        groq_key = config_mgr.get("api_keys", {}).get("groq", "")
+        if groq_key:
+            print("   🤖 [AI 引擎] 启动备用引擎: Groq (Llama 3)...", flush=True)
+            llm = ChatOpenAI(model="llama-3.3-70b-versatile", api_key=groq_key, base_url="https://api.groq.com/openai/v1", temperature=0.1)
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
+        else:
+            raise ValueError("未配置 Groq Token")
+    except Exception as e:
+        print(f"      ⚠️ Groq 引擎调用失败: {type(e).__name__}", flush=True)
+
+    # 3. Gemini (备用引擎，不花钱)
+    try:
         gemini_key = config_mgr.get("api_keys", {}).get("gemini", "")
-        client = genai.Client(api_key=gemini_key)
-        
-        prompt_text = prompt_template.format(**kwargs_dict)
-        interaction = client.interactions.create(
-            model="gemini-3.5-flash",
-            input=prompt_text
-        )
-        return interaction.output_text
+        if gemini_key:
+            print("   🤖 [AI 引擎] 启动备用引擎: Gemini 2.0 Flash...", flush=True)
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=gemini_key, temperature=0.1)
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
+        else:
+            raise ValueError("未配置 Gemini Token")
     except ImportError:
-        print("      ⚠️ 未安装最新版 google-genai，无法调用 Gemini。", flush=True)
+        print("      ⚠️ 未安装 langchain-google-genai，无法调用 Gemini。", flush=True)
     except Exception as e:
         print(f"      ⚠️ Gemini 备用引擎调用失败: {type(e).__name__} - {e}", flush=True)
 
-    # 3. Kimi (最终兜底防线，需扣费)
+    # 4. Kimi (最终兜底防线，需扣费)
     try:
-        print("   🤖 [AI 引擎] 启动最终兜底防线: Kimi (Moonshot)...", flush=True)
         kimi_key = config_mgr.get("api_keys", {}).get("kimi", "")
-        llm = ChatOpenAI(
-            model="kimi-k2.6", 
-            base_url="https://api.moonshot.cn/v1", 
-            api_key=kimi_key,
-            temperature=1.0
-        )
-        chain = prompt_template | llm
-        res = await chain.ainvoke(kwargs_dict)
-        return res.content
+        if kimi_key:
+            print("   🤖 [AI 引擎] 启动最终兜底防线: Kimi (Moonshot)...", flush=True)
+            llm = ChatOpenAI(
+                model="moonshot-v1-8k", 
+                base_url="https://api.moonshot.cn/v1", 
+                api_key=kimi_key,
+                temperature=1.0
+            )
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
+        else:
+            raise ValueError("未配置 Kimi Token")
     except Exception as e:
         print(f"      ⚠️ Kimi 调用失败: {type(e).__name__}", flush=True)
         
-    raise Exception("所有大模型引擎均已阵亡，请补充额度。")
+    raise Exception("所有大模型引擎均已阵亡或未配置，请补充额度或设置 API Key。")
 
 
 async def categorize_file_with_ai(filename, link_text):
@@ -175,6 +191,41 @@ async def generate_initial_archive(course_name, text_content, course_dir):
             f.write(f"# {course_name}\n")
             f.write(f"*归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
             f.write(result_content)
+            
+        print(f"   📅 正在提取【{course_name}】的日程安排并生成日历...", flush=True)
+        ics_prompt = PromptTemplate.from_template(
+            "你是一个严格的日历生成器。请阅读以下已经为你精简好的【课程重点笔记】，提取其中所有需要学生【去参加/去完成】的有明确日期时间的事件。\n\n"
+            "【包含类型】:\n"
+            "1. 所有的作业截止日期 (Deadline)\n"
+            "2. 考试 (Exams) & 测验 (Quiz & Test)\n"
+            "3. 补课 (Replacement Classes) 或 加课 (Additional Classes) - 请具体写明具体时间和教室 (如有)\n\n"
+            "【禁止包含类型】:\n"
+            "1. 纯粹的「课堂取消/停课」(Canceled Class) - 除非伴随有明确的补课时间安排（此时只保留并写入补课日程）\n\n"
+            "如果没有找到任何符合「包含类型」的明确日期事件，请直接回复：NONE\n\n"
+            "如果找到了，请务必直接输出标准 iCalendar (.ics) 格式的内容，不需要任何额外解释。请参照以下模板：\n"
+            "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//WBLE Agent//EN\n"
+            "BEGIN:VEVENT\nSUMMARY:Assignment 1\nDTSTART:20260810T150000Z\nDTEND:20260810T160000Z\nEND:VEVENT\n"
+            "END:VCALENDAR\n\n"
+            "注意：如果没有具体结束时间，可以默认结束时间比开始时间晚一小时。如果只有日期没有具体时间，可以默认为当地时间中午12点。必须输出标准的 ics 文本格式。\n\n"
+            "【课程重点笔记】:\n{web_content}"
+        )
+        try:
+            ics_content = await invoke_llm_with_fallback(ics_prompt, {"web_content": result_content})
+            ics_content = ics_content.strip()
+            
+            # 使用正则严格提取日历文本块，无视大模型生成的啰嗦废话
+            match = re.search(r'(BEGIN:VCALENDAR.*?END:VCALENDAR)', ics_content, re.DOTALL | re.IGNORECASE)
+            
+            if match:
+                ics_path = os.path.join(course_dir, "Reminder.ics")
+                with open(ics_path, "w", encoding="utf-8") as f:
+                    f.write(match.group(1).strip())
+                print("   ✅ 日历文件 Reminder.ics 生成成功！", flush=True)
+            else:
+                print("   ℹ️ 未在课件主页发现具体的截止日期，跳过日历生成。", flush=True)
+        except Exception as e:
+            print(f"   ⚠️ 日历生成失败: {e}", flush=True)
+            
         return True  # 成功
     except Exception:
         print(f"   ⚠️ 笔记生成跳过 (所有大模型引擎均失败或无额度)。", flush=True)
