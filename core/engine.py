@@ -146,10 +146,10 @@ async def categorize_file_with_ai(filename, link_text):
         valid = ["Lectures", "Practicals_and_Tutorials", "Course_Information", "Assignments_and_Projects", "Assessments_and_Exams"]
         for v in valid:
             if v in category:
-                return v
-        return "Others"
+                return v, True
+        return "Others", True  # AI 回复了但确实是 Others
     except Exception:
-        return "Others"
+        return "Others", False  # AI 调用失败，标记为未成功
 
 
 async def generate_initial_archive(course_name, text_content, course_dir):
@@ -175,8 +175,10 @@ async def generate_initial_archive(course_name, text_content, course_dir):
             f.write(f"# {course_name}\n")
             f.write(f"*归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
             f.write(result_content)
+        return True  # 成功
     except Exception:
         print(f"   ⚠️ 笔记生成跳过 (所有大模型引擎均失败或无额度)。", flush=True)
+        return False  # 失败，需要下次重试
 
 
 def smart_categorize_local(filename, link_text):
@@ -259,7 +261,9 @@ async def download_from_current_page(page, course_dir, state_db, course_name):
                         category = smart_categorize_local(safe_fn, link_text)
                         if not category:
                             print(f"        🧠 正则匹配失败，召唤 AI 兜底推理 [{safe_fn}]...", flush=True)
-                            category = await categorize_file_with_ai(safe_fn, link_text)
+                            category, ai_ok = await categorize_file_with_ai(safe_fn, link_text)
+                            if not ai_ok:
+                                state_db[course_name]["has_unclassified_files"] = True
                         else:
                             print(f"        ⚡ 本地急速分类 [{safe_fn}] -> {category}", flush=True)
                             
@@ -308,7 +312,9 @@ async def download_from_current_page(page, course_dir, state_db, course_name):
                     category = smart_categorize_local(safe_filename, link_text)
                     if not category:
                         print(f"      🧠 正则匹配失败，召唤 AI 兜底推理 [{safe_filename}]...", flush=True)
-                        category = await categorize_file_with_ai(safe_filename, link_text)
+                        category, ai_ok = await categorize_file_with_ai(safe_filename, link_text)
+                        if not ai_ok:
+                            state_db[course_name]["has_unclassified_files"] = True
                     else:
                         print(f"      ⚡ 本地急速分类 [{safe_filename}] -> {category}", flush=True)
                         
@@ -491,11 +497,18 @@ class WBLEScanner:
                 course_dir = os.path.join(base_dir, safe_course_name)
                 os.makedirs(course_dir, exist_ok=True)
                 
+                # 确保旧 state 也有新字段（兼容之前的用户数据）
                 if name not in state_db:
-                    state_db[name] = {"hash": "", "downloaded_files": []}
+                    state_db[name] = {"hash": "", "downloaded_files": [], "md_generated": False, "has_unclassified_files": False}
+                else:
+                    state_db[name].setdefault("md_generated", False)
+                    state_db[name].setdefault("has_unclassified_files", False)
+
+                if state_db[name]["hash"] == "":  # 真正初次扫描
                     print(f"   [初次识别] 激活大模型归档与深潜下载模式！", flush=True)
                     new_files, text_content = await deep_scan_course(self.page, link, course_dir, state_db, name)
-                    await generate_initial_archive(name, text_content, course_dir)
+                    md_ok = await generate_initial_archive(name, text_content, course_dir)
+                    state_db[name]["md_generated"] = md_ok
                     current_hash = get_text_hash(text_content)
                     state_db[name]["hash"] = current_hash
                     print(f"   🎉 归档完毕！本次深潜共挖出 {new_files} 份文件。", flush=True)
@@ -520,6 +533,48 @@ class WBLEScanner:
                         })
                     else:
                         print(f"   [状态一致] 暂无更新。", flush=True)
+
+                # ── 自愈机制 1：MD 归档（状态感知 + 文件系统双保险）────────
+                md_path = os.path.join(course_dir, "课程重点归档.md")
+                need_md = not state_db[name].get("md_generated", False) or not os.path.exists(md_path)
+                if need_md and text_content:
+                    print(f"   🔄 [自愈] MD 归档缺失或上次生成失败，正在重新生成...", flush=True)
+                    md_ok = await generate_initial_archive(name, text_content, course_dir)
+                    state_db[name]["md_generated"] = md_ok
+                    if md_ok:
+                        print(f"   ✅ [自愈] MD 归档补全成功！", flush=True)
+                    else:
+                        print(f"   ⚠️ [自愈] MD 生成仍然失败，请检查 API Key 配置，下次会继续重试。", flush=True)
+
+                # ── 自愈机制 2：Others 重分类（状态感知 + 文件系统双保险）──
+                others_dir = os.path.join(course_dir, "Files", "Others")
+                has_others_flag = state_db[name].get("has_unclassified_files", False)
+                others_files_exist = os.path.exists(others_dir) and bool([f for f in os.listdir(others_dir) if os.path.isfile(os.path.join(others_dir, f))])
+                if (has_others_flag or others_files_exist) and os.path.exists(others_dir):
+                    stuck_files = [f for f in os.listdir(others_dir) if os.path.isfile(os.path.join(others_dir, f))]
+                    if stuck_files:
+                        print(f"   🔄 [自愈] 发现 {len(stuck_files)} 个文件上次分类失败，重新召唤 AI 分类...", flush=True)
+                        files_dir = os.path.join(course_dir, "Files")
+                        all_reclassified = True
+                        for fname in stuck_files:
+                            old_path = os.path.join(others_dir, fname)
+                            category, ai_ok = await categorize_file_with_ai(fname, fname)
+                            if not ai_ok:
+                                all_reclassified = False  # AI 仍然失败，下次继续重试
+                                print(f"      ⚠️ {fname} 重分类失败（API 仍不可用），保留在 Others。", flush=True)
+                                continue
+                            new_dir = os.path.join(files_dir, category)
+                            os.makedirs(new_dir, exist_ok=True)
+                            new_path = os.path.join(new_dir, fname)
+                            os.rename(old_path, new_path)
+                            print(f"      ✅ 重新分类: {fname} -> {category}", flush=True)
+                        state_db[name]["has_unclassified_files"] = not all_reclassified
+                        # 如果 Others 文件夹已空，删掉保持整洁
+                        if os.path.exists(others_dir) and not os.listdir(others_dir):
+                            os.rmdir(others_dir)
+                    else:
+                        state_db[name]["has_unclassified_files"] = False
+
             except Exception as e:
                 print(f"   ❌ 访问或处理课程失败: {e}", flush=True)
         
