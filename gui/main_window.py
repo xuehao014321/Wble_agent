@@ -352,8 +352,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "格式错误", "Kimi API Key 格式似乎不对！\n正常应该以 sk- 开头，请参考教程重新获取。")
             return False
             
-        if gemini_key and not gemini_key.startswith("AIza"):
-            QMessageBox.warning(self, "格式错误", "Gemini API Key 格式似乎不对！\n正常应该以 AIza 开头，请参考教程重新获取。")
+        if gemini_key and not (gemini_key.startswith("AIza") or gemini_key.startswith("AQ")):
+            QMessageBox.warning(self, "格式错误", "Gemini API Key 格式似乎不对！\n正常应该以 AIza 或 AQ 开头，请参考教程重新获取。")
             return False
 
         config_mgr.set("download_dir", self.in_path.text())
