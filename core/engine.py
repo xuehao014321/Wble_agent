@@ -240,12 +240,12 @@ def smart_categorize_local(filename, link_text):
         return "Course_Information"
         
     # 2. 实验/辅导课类 (匹配 P01, T01, tutorial, practical, lab, answer)
-    # \b 确保匹配的是独立的词组，比如 P01，而不是包含在单词里的字母
-    if re.search(r'\b[pt]\d{1,2}\b|tutorial|practical|lab|ans', text):
+    # \b 确保匹配的是独立的词组，(?:\b|_) 允许紧跟下划线，例如 P07_
+    if re.search(r'\b[pt]\d{1,2}(?:\b|_)|tutorial|practical|lab|ans', text):
         return "Practicals_and_Tutorials"
         
     # 3. 理论课类 (匹配 L01, lecture, slide, chapter, note)
-    if re.search(r'\bl\d{1,2}\b|lecture|slide|chapter|topic|note', text):
+    if re.search(r'\bl\d{1,2}(?:\b|_)|lecture|slide|chapter|topic|note', text):
         return "Lectures"
         
     # 4. 考试测验类
