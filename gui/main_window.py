@@ -169,9 +169,26 @@ class MainWindow(QMainWindow):
         lbl_console = QLabel("Activity Log")
         lbl_console.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f;")
         
+        # Right Sidebar Toggle Button
+        self.btn_toggle_right = QToolButton()
+        right_sidebar_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#515154" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="15" y1="3" x2="15" y2="21"></line>
+        </svg>"""
+        svg_path_right = os.path.join(tempfile.gettempdir(), "right_sidebar_icon.svg")
+        with open(svg_path_right, "w", encoding="utf-8") as f:
+            f.write(right_sidebar_svg)
+            
+        self.btn_toggle_right.setIcon(QIcon(svg_path_right))
+        self.btn_toggle_right.setIconSize(QSize(20, 20))
+        self.btn_toggle_right.setToolTip("Toggle Settings")
+        self.btn_toggle_right.setStyleSheet("QToolButton { border: none; padding: 4px; border-radius: 6px; } QToolButton:hover { background-color: #e5e5ea; }")
+        self.btn_toggle_right.clicked.connect(self.toggle_right_sidebar)
+        
         center_top_layout.addWidget(self.btn_toggle_sidebar)
         center_top_layout.addWidget(lbl_console)
         center_top_layout.addStretch()
+        center_top_layout.addWidget(self.btn_toggle_right)
         
         center_panel.addLayout(center_top_layout)
         
@@ -416,6 +433,25 @@ class MainWindow(QMainWindow):
             
         self.anim.start()
 
+    def toggle_right_sidebar(self):
+        # Settings collapse/expand using QPropertyAnimation
+        self.anim_right = QPropertyAnimation(self.right_panel_widget, b"maximumWidth")
+        self.anim_right.setDuration(250)
+        self.anim_right.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        
+        if self.right_panel_widget.maximumWidth() == 0:
+            # Expand
+            self.anim_right.setStartValue(0)
+            self.anim_right.setEndValue(400)
+            self.right_panel_widget.setMinimumWidth(250)
+        else:
+            # Collapse
+            self.right_panel_widget.setMinimumWidth(0)
+            self.anim_right.setStartValue(self.right_panel_widget.width())
+            self.anim_right.setEndValue(0)
+            
+        self.anim_right.start()
+
     def create_help_btn(self, title, text):
         btn = QPushButton("i")
         btn.setFixedSize(24, 24)
@@ -475,12 +511,14 @@ class MainWindow(QMainWindow):
             if course not in blacklist:
                 # Custom widget for list item
                 item_widget = QWidget()
+                item_widget.setMinimumHeight(44)  # 强制最小高度，防止排版被裁切
                 h_layout = QHBoxLayout(item_widget)
-                h_layout.setContentsMargins(5, 5, 5, 5)
+                h_layout.setContentsMargins(8, 8, 8, 8)
                 h_layout.setSpacing(5)
                 
                 lbl_name = QLabel(course)
                 lbl_name.setStyleSheet("font-size: 13px; font-weight: 500;")
+                lbl_name.setWordWrap(True)  # 允许文字换行，防止宽度过窄时压缩高度
                 h_layout.addWidget(lbl_name, stretch=1)
                 
                 course_state = states.get(course, {})
