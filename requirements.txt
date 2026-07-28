@@ -1,8 +1,0 @@
-langchain-openai
-langchain-google-genai
-langchain
-playwright
-PyQt6
-qasync
-beautifulsoup4
-html2text

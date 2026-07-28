@@ -244,12 +244,12 @@ def smart_categorize_local(filename, link_text):
         return "Course_Information"
         
     # 2. 实验/辅导课类 (匹配 P01, T01, tutorial, practical, lab, answer)
-    # \b 确保匹配的是独立的词组，比如 P01，而不是包含在单词里的字母
-    if re.search(r'\b[pt]\d{1,2}\b|tutorial|practical|lab|ans', text):
+    # \b 确保匹配的是独立的词组，(?:\b|_) 允许紧跟下划线，例如 P07_
+    if re.search(r'\b[pt]\d{1,2}(?:\b|_)|tutorial|practical|lab|ans', text):
         return "Practicals_and_Tutorials"
         
     # 3. 理论课类 (匹配 L01, lecture, slide, chapter, note)
-    if re.search(r'\bl\d{1,2}\b|lecture|slide|chapter|topic|note', text):
+    if re.search(r'\bl\d{1,2}(?:\b|_)|lecture|slide|chapter|topic|note', text):
         return "Lectures"
         
     # 4. 考试测验类
@@ -402,22 +402,17 @@ async def deep_scan_course(page, course_link, course_dir, state_db, course_name)
     await page.goto(course_link, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
     
-    # 尝试仅抓取主要课程区域，避免侧边栏（最新活动、在线用户、时间戳）导致频繁的 Hash 误报
+    # 只严格抓取中间内容区，坚决拒绝抓取全网页 (body)，防止侧边栏的时间戳/在线人数导致 Hash 频繁变动
     text_content = ""
-    # 优先匹配 middle-column (WBLE经典主题结构)，再匹配 region-main (Moodle新版Boost主题)
-    for selector in ["#middle-column", ".middle-column", "#region-main", ".course-content", "[role='main']", "body"]:
-        locator = page.locator(selector).first
-        try:
-            if await locator.is_visible():
-                text_content = await locator.inner_text()
-                break
-        except Exception:
-            continue
-            
+    locator = page.locator("#middle-column").first
+    try:
+        if await locator.is_visible():
+            text_content = await locator.inner_text()
+    except Exception:
+        pass
+        
     if not text_content:
-        text_content = await page.inner_text("body")
-    
-    
+        print(f"      ⚠️ 警告: 无法在【{course_name}】找到标准内容区(#middle-column)，提取内容可能为空！", flush=True)
     # 抓取页面中的外部会议/文档链接，注入到纯文本供大模型分析
     external_links = await page.evaluate('''() => {
         const keywords = ['teams.microsoft', 'docs.google', 'drive.google', 'zoom.us', 'webex', 'meet.google', 'chat.whatsapp'];
@@ -617,8 +612,13 @@ class WBLEScanner:
                             new_dir = os.path.join(files_dir, category)
                             os.makedirs(new_dir, exist_ok=True)
                             new_path = os.path.join(new_dir, fname)
-                            os.rename(old_path, new_path)
-                            print(f"      ✅ 重新分类: {fname} -> {category}", flush=True)
+                            if os.path.exists(new_path):
+                                # 目标路径已有同名文件（正确位置已存在），直接删掉 Others 里的重复副本
+                                os.remove(old_path)
+                                print(f"      ✅ 目标已存在，清除 Others 重复副本: {fname}", flush=True)
+                            else:
+                                os.rename(old_path, new_path)
+                                print(f"      ✅ 重新分类: {fname} -> {category}", flush=True)
                         state_db[name]["has_unclassified_files"] = not all_reclassified
                         # 如果 Others 文件夹已空，删掉保持整洁
                         if os.path.exists(others_dir) and not os.listdir(others_dir):
