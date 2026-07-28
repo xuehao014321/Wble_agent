@@ -566,8 +566,13 @@ class WBLEScanner:
                             new_dir = os.path.join(files_dir, category)
                             os.makedirs(new_dir, exist_ok=True)
                             new_path = os.path.join(new_dir, fname)
-                            os.rename(old_path, new_path)
-                            print(f"      ✅ 重新分类: {fname} -> {category}", flush=True)
+                            if os.path.exists(new_path):
+                                # 目标路径已有同名文件（正确位置已存在），直接删掉 Others 里的重复副本
+                                os.remove(old_path)
+                                print(f"      ✅ 目标已存在，清除 Others 重复副本: {fname}", flush=True)
+                            else:
+                                os.rename(old_path, new_path)
+                                print(f"      ✅ 重新分类: {fname} -> {category}", flush=True)
                         state_db[name]["has_unclassified_files"] = not all_reclassified
                         # 如果 Others 文件夹已空，删掉保持整洁
                         if os.path.exists(others_dir) and not os.listdir(others_dir):
