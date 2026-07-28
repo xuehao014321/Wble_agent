@@ -8,11 +8,22 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem, QSlider, QComboBox,
     QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton, QAbstractItemView
 )
-from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath
+from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath, QMovie
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QSize, QPoint
 
 from core.config import config_mgr
 from core.engine import WBLEScanner
+
+
+def resource_path(filename):
+    """Return an asset path that works from source and a PyInstaller bundle."""
+    base_dir = getattr(
+        sys,
+        "_MEIPASS",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    return os.path.join(base_dir, filename)
+
 
 class LogStream(QObject):
     textWritten = pyqtSignal(str)
@@ -61,6 +72,8 @@ class ToastNotification(QWidget):
         
         self.animation = QPropertyAnimation(self.opacity_effect, b"opacity")
         self.animation.setDuration(300)
+        self.animation.setStartValue(0.0)
+        self.animation.setEndValue(1.0)
         
         self.timer = QTimer()
         self.timer.setSingleShot(True)
@@ -97,6 +110,59 @@ class ToastNotification(QWidget):
     def _on_hide_finished(self):
         self.animation.finished.disconnect(self._on_hide_finished)
         self.hide()
+
+
+class ScanSuccessAnimation(QWidget):
+    def __init__(self, animation_path, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("background: transparent;")
+        layout.addWidget(self.label)
+
+        self.movie = QMovie(animation_path)
+        self.movie.setCacheMode(QMovie.CacheMode.CacheAll)
+        self.label.setMovie(self.movie)
+
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.stop_and_hide)
+        self.hide()
+
+    def play(self):
+        if not self.movie.isValid():
+            return False
+
+        self.movie.stop()
+        self.movie.jumpToFrame(0)
+        frame_size = self.movie.currentPixmap().size()
+        if frame_size.isValid():
+            self.setFixedSize(frame_size)
+
+        if self.parent():
+            parent_rect = self.parent().rect()
+            self.move(
+                parent_rect.center().x() - self.width() // 2,
+                parent_rect.center().y() - self.height() // 2
+            )
+
+        self.raise_()
+        self.show()
+        self.movie.start()
+        self.hide_timer.start(3000)
+        return True
+
+    def stop_and_hide(self):
+        self.movie.stop()
+        self.hide()
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -455,6 +521,10 @@ class MainWindow(QMainWindow):
         self.splitter.setSizes([250, 500, 300])
         
         self.toast = ToastNotification(self)
+        self.scan_success_animation = ScanSuccessAnimation(
+            resource_path("scan_success.webp"),
+            self
+        )
 
     def toggle_sidebar(self):
         # Teams style collapse/expand using QPropertyAnimation
@@ -800,8 +870,8 @@ class MainWindow(QMainWindow):
             self.refresh_course_list()
             if updates:
                 self.tray_icon.showMessage("WBLE 有新动态！", f"发现 {len(updates)} 门课有更新，课件已下载！", QSystemTrayIcon.MessageIcon.Information, 5000)
-            if not is_background:
-                # 手动扫描才显示界面内浮层，后台无更新时保持完全静默。
+            if not self.scan_success_animation.play() and not is_background:
+                # 打包遗漏动画资源时，手动扫描仍保留文字提示作为兜底。
                 self.toast.show_toast("🎉 WBLE 环境扫描完毕！")
         except Exception as e:
             print(f"❌ 扫描过程中发生错误: {e}")

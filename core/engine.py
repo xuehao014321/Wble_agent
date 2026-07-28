@@ -5,6 +5,7 @@ import io
 import time
 import json
 import hashlib
+import difflib
 import re
 import urllib.request
 import urllib.parse
@@ -20,6 +21,11 @@ if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
 
 TARGET_URL = "https://wble.utar.edu.my/"
 AUTH_STATE_FILE = os.path.join(os.getcwd(), "wble_auth_state.json")
+SNAPSHOT_VERSION = 2
+VOLATILE_QUERY_PARAMS = {
+    "sesskey", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+    "utm_content", "fbclid", "gclid", "ouid", "rtpof", "sd", "usp"
+}
 
 # ================= 工具函数 =================
 
@@ -39,6 +45,182 @@ def send_wechat_notification(title, desp):
 
 def get_text_hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def normalize_text(text):
+    """Normalize DOM text without discarding meaningful course wording."""
+    if not text:
+        return ""
+    text = str(text).replace("\u00a0", " ").replace("\u200b", "")
+    lines = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        normalized_line = " ".join(line.split())
+        if normalized_line:
+            lines.append(normalized_line)
+    return "\n".join(lines)
+
+
+def canonicalize_url(url):
+    """Remove volatile URL parts and produce a deterministic query order."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme in {"mailto", "tel"}:
+            return url.strip()
+        query_items = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                parsed.query, keep_blank_values=True
+            )
+            if key.lower() not in VOLATILE_QUERY_PARAMS
+        ]
+        query_items.sort()
+        return urllib.parse.urlunsplit((
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            urllib.parse.urlencode(query_items, doseq=True),
+            ""
+        ))
+    except Exception:
+        return url.strip()
+
+
+def get_snapshot_hash(snapshot):
+    serialized = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return get_text_hash(serialized)
+
+
+def snapshot_to_text(snapshot):
+    """Render a structured snapshot into deterministic text for MD/AI input."""
+    lines = []
+    for section in snapshot.get("sections", []):
+        section_id = section.get("id", "section")
+        title = section.get("title", "")
+        lines.append(f"【{section_id}】 {title}".strip())
+        summary = section.get("summary", "")
+        if summary:
+            lines.append(summary)
+        for activity in section.get("activities", []):
+            activity_type = activity.get("type", "activity")
+            text = activity.get("text", "")
+            lines.append(
+                f"- [{activity_type}] {activity.get('id', '')}: {text}".strip()
+            )
+            for link in activity.get("links", []):
+                lines.append(
+                    f"  - {link.get('text') or 'Link'}: {link.get('url', '')}"
+                )
+    external_links = snapshot.get("external_links", [])
+    if external_links:
+        lines.append("【重要外部链接】")
+        for link in external_links:
+            lines.append(f"- {link.get('text') or 'Link'}: {link.get('url', '')}")
+    return "\n".join(lines)
+
+
+def _flatten_activities(snapshot):
+    activities = {}
+    for section in snapshot.get("sections", []):
+        for activity in section.get("activities", []):
+            key = activity.get("id") or (
+                activity.get("type"),
+                activity.get("text"),
+                tuple(link.get("url", "") for link in activity.get("links", []))
+            )
+            activities[str(key)] = {
+                **activity,
+                "section_id": section.get("id", "")
+            }
+    return activities
+
+
+def diff_course_snapshots(old_snapshot, new_snapshot):
+    """Return a deterministic, human-readable diff for the AI to explain."""
+    changes = []
+    old_activities = _flatten_activities(old_snapshot)
+    new_activities = _flatten_activities(new_snapshot)
+
+    for key in sorted(new_activities.keys() - old_activities.keys()):
+        item = new_activities[key]
+        changes.append(
+            f"新增活动 [{item.get('type', 'activity')}] "
+            f"{item.get('text', '')} ({item.get('id', key)})"
+        )
+
+    for key in sorted(old_activities.keys() - new_activities.keys()):
+        item = old_activities[key]
+        changes.append(
+            f"移除活动 [{item.get('type', 'activity')}] "
+            f"{item.get('text', '')} ({item.get('id', key)})"
+        )
+
+    for key in sorted(old_activities.keys() & new_activities.keys()):
+        old_item = old_activities[key]
+        new_item = new_activities[key]
+        comparable_fields = ("type", "text", "links", "section_id")
+        if any(old_item.get(field) != new_item.get(field) for field in comparable_fields):
+            changes.append(
+                f"修改活动 {new_item.get('id', key)}:\n"
+                f"  旧: {old_item.get('text', '')}\n"
+                f"  新: {new_item.get('text', '')}"
+            )
+
+    old_sections = {
+        item.get("id", ""): item for item in old_snapshot.get("sections", [])
+    }
+    new_sections = {
+        item.get("id", ""): item for item in new_snapshot.get("sections", [])
+    }
+    for section_id in sorted(new_sections.keys() - old_sections.keys()):
+        section = new_sections[section_id]
+        changes.append(
+            f"新增章节 {section_id}: {section.get('title', '')}"
+        )
+    for section_id in sorted(old_sections.keys() - new_sections.keys()):
+        section = old_sections[section_id]
+        changes.append(
+            f"移除章节 {section_id}: {section.get('title', '')}"
+        )
+    for section_id in sorted(old_sections.keys() & new_sections.keys()):
+        old_section = old_sections[section_id]
+        new_section = new_sections[section_id]
+        old_header = (old_section.get("title", ""), old_section.get("summary", ""))
+        new_header = (new_section.get("title", ""), new_section.get("summary", ""))
+        if old_header != new_header:
+            changes.append(
+                f"修改章节 {section_id}:\n"
+                f"  旧: {' | '.join(part for part in old_header if part)}\n"
+                f"  新: {' | '.join(part for part in new_header if part)}"
+            )
+
+    old_links = {
+        (item.get("text", ""), item.get("url", ""))
+        for item in old_snapshot.get("external_links", [])
+    }
+    new_links = {
+        (item.get("text", ""), item.get("url", ""))
+        for item in new_snapshot.get("external_links", [])
+    }
+    for text, url in sorted(new_links - old_links):
+        changes.append(f"新增外部链接: {text or 'Link'} — {url}")
+    for text, url in sorted(old_links - new_links):
+        changes.append(f"移除外部链接: {text or 'Link'} — {url}")
+
+    if not changes:
+        old_lines = snapshot_to_text(old_snapshot).splitlines()
+        new_lines = snapshot_to_text(new_snapshot).splitlines()
+        fallback_diff = list(difflib.unified_diff(
+            old_lines, new_lines, fromfile="旧快照", tofile="新快照", lineterm=""
+        ))
+        if fallback_diff:
+            changes.append("结构顺序或其他内容发生变化:\n" + "\n".join(fallback_diff[:80]))
+
+    return "\n".join(changes)
+
 
 def is_valid_course(title: str) -> bool:
     title = title.strip()
@@ -407,74 +589,235 @@ async def download_from_current_page(page, course_dir, state_db, course_name):
             
     return new_files_count
 
+def _normalize_link_list(items):
+    normalized_items = {}
+    for item in items or []:
+        text = normalize_text(item.get("text", ""))
+        url = canonicalize_url(item.get("url", ""))
+        if not url:
+            continue
+        normalized_items[(text, url)] = {"text": text, "url": url}
+    return [
+        normalized_items[key]
+        for key in sorted(normalized_items, key=lambda value: (value[1], value[0]))
+    ]
+
+
+async def extract_course_snapshot(page, course_name):
+    """
+    Extract the stable old-Moodle course structure seen in UTAR WBLE.
+    Never falls back to .course-content because it wraps all three columns.
+    """
+    try:
+        raw_snapshot = await page.evaluate('''() => {
+            const root = document.querySelector("#middle-column");
+            if (!root) {
+                return {ok: false, reason: "missing #middle-column"};
+            }
+
+            const cleanText = (node) => {
+                if (!node) return "";
+                const clone = node.cloneNode(true);
+                clone.querySelectorAll(
+                    "script, style, form, .side, .accesshide"
+                ).forEach(el => el.remove());
+                return clone.innerText || clone.textContent || "";
+            };
+
+            const knownTypes = [
+                "resource", "label", "forum", "assignment", "assign",
+                "folder", "page", "quiz", "url"
+            ];
+            const rows = Array.from(
+                root.querySelectorAll(
+                    "table.weeks tr.section[id^='section-'], "
+                    + "table.topics tr.section[id^='section-']"
+                )
+            );
+            const sections = rows.map(row => {
+                const content = row.querySelector("td.content");
+                const activities = content
+                    ? Array.from(
+                        content.querySelectorAll(
+                            "li.activity[id^='module-']"
+                        )
+                    ).map(item => {
+                        const classes = Array.from(item.classList);
+                        const type = knownTypes.find(name => classes.includes(name))
+                            || classes.find(name => name !== "activity")
+                            || "activity";
+                        const links = Array.from(
+                            item.querySelectorAll("a[href]")
+                        ).map(link => ({
+                            text: cleanText(link).trim() || "Link",
+                            url: link.href
+                        }));
+                        return {
+                            id: item.id,
+                            type,
+                            text: cleanText(item),
+                            links
+                        };
+                    })
+                    : [];
+                return {
+                    id: row.id,
+                    title: cleanText(
+                        row.querySelector(".weekdates, .sectionname")
+                    ),
+                    summary: cleanText(
+                        content ? content.querySelector(".summary") : null
+                    ),
+                    activities
+                };
+            });
+
+            const keywords = [
+                "teams.microsoft", "docs.google", "drive.google", "zoom.us",
+                "webex", "meet.google", "chat.whatsapp"
+            ];
+            const externalLinks = Array.from(root.querySelectorAll("a[href]"))
+                .filter(link => keywords.some(key => link.href.includes(key)))
+                .map(link => ({
+                    text: cleanText(link).trim() || "Link",
+                    url: link.href
+                }));
+
+            return {
+                ok: rows.length > 0,
+                reason: rows.length > 0
+                    ? ""
+                    : "missing table.weeks/table.topics section rows",
+                sections,
+                external_links: externalLinks
+            };
+        }''')
+    except Exception as e:
+        return None, f"DOM extraction error: {e}"
+
+    if not raw_snapshot or not raw_snapshot.get("ok"):
+        reason = (raw_snapshot or {}).get("reason", "empty extraction result")
+        return None, reason
+
+    sections = []
+    for section in raw_snapshot.get("sections", []):
+        activities = []
+        for activity in section.get("activities", []):
+            activities.append({
+                "id": normalize_text(activity.get("id", "")),
+                "type": normalize_text(activity.get("type", "")) or "activity",
+                "text": normalize_text(activity.get("text", "")),
+                "links": _normalize_link_list(activity.get("links", []))
+            })
+        sections.append({
+            "id": normalize_text(section.get("id", "")),
+            "title": normalize_text(section.get("title", "")),
+            "summary": normalize_text(section.get("summary", "")),
+            "activities": activities
+        })
+
+    snapshot = {
+        "version": SNAPSHOT_VERSION,
+        "course": course_name,
+        "sections": sections,
+        "external_links": _normalize_link_list(
+            raw_snapshot.get("external_links", [])
+        )
+    }
+    activity_count = sum(
+        len(section.get("activities", [])) for section in sections
+    )
+    if not sections or activity_count == 0:
+        return None, (
+            f"implausible course structure: sections={len(sections)}, "
+            f"activities={activity_count}"
+        )
+    return snapshot, ""
+
+
 async def deep_scan_course(page, course_link, course_dir, state_db, course_name):
-    """深潜抓取机制：扫描主页以及所有文件夹子页面"""
-    # 1. 抓取课程主页直连的文件
+    """Scan the course homepage and linked content pages."""
     await page.goto(course_link, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
-    
-    # 只严格抓取中间内容区，坚决拒绝抓取全网页 (body)
-    text_content = ""
-    try:
-        # Playwright 的 inner_text 自带自动等待机制，比手动的 is_visible 更可靠
-        text_content = await page.inner_text("#middle-column", timeout=5000)
-    except Exception:
-        try:
-            # 兼容有些课程可能使用 .course-content 包装
-            text_content = await page.inner_text(".course-content", timeout=2000)
-        except Exception:
-            pass
-            
-    if not text_content:
-        print(f"      ⚠️ 警告: 无法在【{course_name}】找到标准内容区(#middle-column)，提取内容可能为空！", flush=True)
-    # 抓取页面中的外部会议/文档链接，注入到纯文本供大模型分析
-    external_links = await page.evaluate('''() => {
-        const keywords = ['teams.microsoft', 'docs.google', 'drive.google', 'zoom.us', 'webex', 'meet.google', 'chat.whatsapp'];
-        const links = Array.from(document.querySelectorAll('a'));
-        return links
-            .filter(a => keywords.some(k => a.href.includes(k)))
-            .map(a => `- [${a.innerText.trim() || 'Link'}](${a.href})`);
-    }''')
-    if external_links:
-        unique_links = list(set(external_links))
-        text_content += "\n\n【页面中提取到的重要外部链接】:\n" + "\n".join(unique_links)
-        
-    total_new_files = 0
-    total_new_files += await download_from_current_page(page, course_dir, state_db, course_name)
-    
-    # 2. 寻找潜藏的子页面 (比如 Moodle 的 Folder 插件)
-    sub_links_locators = await page.locator("a[href*='mod/folder/view.php'], a[href*='mod/page/view.php']").all()
+
+    snapshot, extraction_error = await extract_course_snapshot(page, course_name)
+    extraction_ok = snapshot is not None
+    text_content = snapshot_to_text(snapshot) if extraction_ok else ""
+    if extraction_ok:
+        activity_count = sum(
+            len(section.get("activities", []))
+            for section in snapshot.get("sections", [])
+        )
+        print(
+            f"      🧭 结构化提取成功: "
+            f"{len(snapshot.get('sections', []))} 个章节, "
+            f"{activity_count} 个活动。",
+            flush=True
+        )
+    else:
+        print(
+            f"      ⚠️ 内容提取失败 ({extraction_error})。"
+            "本轮不会覆盖旧快照或触发文字更新。",
+            flush=True
+        )
+
+    total_new_files = await download_from_current_page(
+        page, course_dir, state_db, course_name
+    )
+
+    # Include content-bearing activity pages. Their resource links are downloaded,
+    # while the course-page module inventory remains the deterministic snapshot.
+    subpage_selector = ", ".join([
+        "a[href*='mod/folder/view.php']",
+        "a[href*='mod/page/view.php']",
+        "a[href*='mod/forum/view.php']",
+        "a[href*='mod/assignment/view.php']",
+        "a[href*='mod/assign/view.php']"
+    ])
+    sub_links_locators = await page.locator(subpage_selector).all()
     sub_hrefs = []
-    for el in sub_links_locators:
-        href = await el.get_attribute("href")
+    for element in sub_links_locators:
+        href = canonicalize_url(await element.get_attribute("href"))
         if href and href not in sub_hrefs:
             sub_hrefs.append(href)
-            
-    # 3. 执行深潜
+
     for sub_href in sub_hrefs:
-        print(f"      🤿 正在深潜进入子网页: {sub_href.split('id=')[-1]}", flush=True)
+        print(
+            f"      🤿 正在深潜进入子网页: {sub_href.split('id=')[-1]}",
+            flush=True
+        )
         try:
             await page.goto(sub_href, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
-            total_new_files += await download_from_current_page(page, course_dir, state_db, course_name)
+            total_new_files += await download_from_current_page(
+                page, course_dir, state_db, course_name
+            )
         except Exception:
             print("      ⚠️ 深潜失败，跳过该子页面", flush=True)
-            
-    # 最后一定要回到主页以便抓取文本作后续 Diff (或者直接用第一次抓取的 text_content)
-    return total_new_files, text_content
 
-async def analyze_course_updates(course_name, new_text):
+    return total_new_files, text_content, snapshot, extraction_ok
+
+
+async def analyze_course_updates(course_name, diff_text, new_text):
     try:
         prompt = PromptTemplate.from_template(
-            "我抓取了同一门课【{course_name}】的最新网页内容。\n"
-            "请对比并总结出：老师【刚刚】发布了什么新内容？（可能是新公告，或是新布置的作业）。\n"
-            "请用极其精简的一句话或列表总结。\n\n【网页内容】:\n{new_text}"
+            "你正在分析课程【{course_name}】一次已经由程序精确确认的网页变化。\n"
+            "下面的【确定性差异】来自旧、新结构化快照，不要猜测差异之外的内容。\n"
+            "请用极其精简的一句话或列表说明老师新增、修改或移除了什么；"
+            "优先指出公告、截止日期、作业和课件。\n\n"
+            "【确定性差异】\n{diff_text}\n\n"
+            "【最新课程内容（仅作语境参考）】\n{new_text}"
         )
-        result_content = await invoke_llm_with_fallback(prompt, {"course_name": course_name, "new_text": new_text[:6000]})
+        result_content = await invoke_llm_with_fallback(prompt, {
+            "course_name": course_name,
+            "diff_text": diff_text[:6000],
+            "new_text": new_text[:6000]
+        })
         return result_content
     except Exception as e:
         print(f"   ⚠️ 大模型分析更新失败 (所有引擎均失败或无额度): {e}", flush=True)
-        return "网页有更新，但所有 AI 引擎额度耗尽，未能自动总结。"
+        deterministic_summary = diff_text[:1200] or "课程结构发生变化。"
+        return f"已确认网页更新：\n{deterministic_summary}"
 
 class WBLEScanner:
     def __init__(self):
@@ -591,56 +934,117 @@ class WBLEScanner:
                 
                 # 确保旧 state 也有新字段（兼容之前的用户数据）
                 if name not in state_db:
-                    state_db[name] = {"hash": "", "downloaded_files": [], "md_generated": False, "ics_generated": False, "has_unclassified_files": False}
-                else:
-                    state_db[name].setdefault("md_generated", False)
-                    state_db[name].setdefault("ics_generated", False)
-                    state_db[name].setdefault("has_unclassified_files", False)
+                    state_db[name] = {}
+                course_state = state_db[name]
+                course_state.setdefault("hash", "")
+                course_state.setdefault("downloaded_files", [])
+                course_state.setdefault("md_generated", False)
+                course_state.setdefault("ics_generated", False)
+                course_state.setdefault("has_unclassified_files", False)
 
-                if state_db[name]["hash"] == "":  # 真正初次扫描
-                    print(f"   [初次识别] 激活大模型归档与深潜下载模式！", flush=True)
-                    new_files, text_content = await deep_scan_course(self.page, link, course_dir, state_db, name)
-                    md_ok = await generate_md_archive(name, text_content, course_dir)
-                    state_db[name]["md_generated"] = md_ok
-                    
-                    if md_ok:
-                        ics_ok = await generate_ics_calendar(name, course_dir)
-                        state_db[name]["ics_generated"] = ics_ok
-                    current_hash = get_text_hash(text_content)
-                    state_db[name]["hash"] = current_hash
-                    print(f"   🎉 归档完毕！本次深潜共挖出 {new_files} 份文件。", flush=True)
-                else:
-                    new_files, text_content = await deep_scan_course(self.page, link, course_dir, state_db, name)
-                    current_hash = get_text_hash(text_content)
-                    if state_db[name]["hash"] != current_hash:
-                        print(f"   🚨 发现更新！网页文字发生变化。", flush=True)
-                        summary = await analyze_course_updates(name, text_content)
+                old_snapshot = course_state.get("content_snapshot")
+                if not isinstance(old_snapshot, dict):
+                    old_snapshot = None
+                had_legacy_baseline = bool(course_state.get("hash"))
+                is_first_scan = old_snapshot is None and not had_legacy_baseline
+
+                new_files, text_content, new_snapshot, extraction_ok = (
+                    await deep_scan_course(
+                        self.page, link, course_dir, state_db, name
+                    )
+                )
+
+                content_changed = False
+                if extraction_ok:
+                    current_hash = get_snapshot_hash(new_snapshot)
+                    if old_snapshot is None:
+                        course_state["content_snapshot"] = new_snapshot
+                        course_state["snapshot_version"] = SNAPSHOT_VERSION
+                        course_state["hash"] = current_hash
+                        if is_first_scan:
+                            print(
+                                f"   [初次识别] 已建立结构化内容基线；"
+                                f"本次深潜共挖出 {new_files} 份文件。",
+                                flush=True
+                            )
+                        else:
+                            # Existing hash-only users migrate silently. Comparing a
+                            # raw-text hash with a structured hash would be a false alert.
+                            print(
+                                "   🔄 已从旧版纯哈希状态迁移到结构化快照，"
+                                "本轮仅建立新基线，不发送更新通知。",
+                                flush=True
+                            )
+                    elif (
+                        old_snapshot.get("version") != SNAPSHOT_VERSION
+                        or course_state.get("snapshot_version")
+                        != SNAPSHOT_VERSION
+                    ):
+                        course_state["content_snapshot"] = new_snapshot
+                        course_state["snapshot_version"] = SNAPSHOT_VERSION
+                        course_state["hash"] = current_hash
+                        print(
+                            "   🔄 结构化快照规则已升级，本轮仅重建基线，"
+                            "不发送更新通知。",
+                            flush=True
+                        )
+                    elif course_state.get("hash") != current_hash:
+                        diff_text = diff_course_snapshots(
+                            old_snapshot, new_snapshot
+                        )
+                        print(
+                            "   🚨 发现更新！结构化课程内容发生变化。",
+                            flush=True
+                        )
+                        summary = await analyze_course_updates(
+                            name, diff_text, text_content
+                        )
                         updates_found.append({
                             "course": name,
                             "summary": summary,
                             "files_count": new_files
                         })
-                        state_db[name]["hash"] = current_hash
-                        # 内容有更新，强制重新生成笔记和日历
-                        state_db[name]["md_generated"] = False
-                        state_db[name]["ics_generated"] = False
-                    elif new_files > 0:
-                        print(f"   📦 网页文字虽未变，但在子文件夹深潜抓到了 {new_files} 份新课件！", flush=True)
-                        updates_found.append({
-                            "course": name,
-                            "summary": "文字无大更新，但抓取到了隐藏的新课件文件。",
-                            "files_count": new_files
-                        })
+                        course_state["content_snapshot"] = new_snapshot
+                        course_state["snapshot_version"] = SNAPSHOT_VERSION
+                        course_state["hash"] = current_hash
+                        course_state["md_generated"] = False
+                        course_state["ics_generated"] = False
+                        content_changed = True
                     else:
-                        print(f"   [状态一致] 暂无更新。", flush=True)
+                        print("   [状态一致] 结构化课程内容暂无更新。", flush=True)
+                else:
+                    print(
+                        "   🛡️ 已启用失败保护：旧快照、旧哈希和 MD "
+                        "均保持不变。",
+                        flush=True
+                    )
+
+                if (
+                    new_files > 0
+                    and not content_changed
+                    and not is_first_scan
+                ):
+                    print(
+                        f"   📦 课程文字未确认变化，但深潜抓到了 "
+                        f"{new_files} 份新课件！",
+                        flush=True
+                    )
+                    updates_found.append({
+                        "course": name,
+                        "summary": "课程文字未确认变化，但抓取到了新的课件文件。",
+                        "files_count": new_files
+                    })
 
                 # ── 自愈机制 1：MD 归档（状态感知 + 文件系统双保险）────────
                 md_path = os.path.join(course_dir, "课程重点归档.md")
-                need_md = not state_db[name].get("md_generated", False) or not os.path.exists(md_path)
+                need_md = (
+                    not course_state.get("md_generated", False)
+                    or not os.path.exists(md_path)
+                )
                 if need_md and text_content:
                     print(f"   🔄 [自愈] MD 归档缺失或上次生成失败，正在重新生成...", flush=True)
                     md_ok = await generate_md_archive(name, text_content, course_dir)
-                    state_db[name]["md_generated"] = md_ok
+                    course_state["md_generated"] = md_ok
                     if md_ok:
                         print(f"   ✅ [自愈] MD 归档补全成功！", flush=True)
                     else:
@@ -651,7 +1055,7 @@ class WBLEScanner:
                 if need_ics and os.path.exists(md_path):
                     print(f"   🔄 [自愈] ICS 日历未同步，正在自动对齐更新...", flush=True)
                     ics_ok = await generate_ics_calendar(name, course_dir)
-                    state_db[name]["ics_generated"] = ics_ok
+                    course_state["ics_generated"] = ics_ok
 
                 # ── 自愈机制 2：Others 重分类（状态感知 + 文件系统双保险）──
                 others_dir = os.path.join(course_dir, "Files", "Others")

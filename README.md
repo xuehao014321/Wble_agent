@@ -56,7 +56,7 @@ python main.py
 To compile the project into a standalone executable (`.exe`) optimized for extremely fast startup and low file size, run:
 
 ```powershell
-pyinstaller --noconsole --name UTAR_WBLE_Agent --icon utar_logo.png --add-data "utar_logo.png;." --exclude-module PyQt5 --exclude-module torch --exclude-module scipy --exclude-module pandas --exclude-module pyarrow --exclude-module onnxruntime --exclude-module matplotlib --exclude-module botocore -y main.py
+pyinstaller --noconsole --name UTAR_WBLE_Agent --icon utar_logo.png --add-data "utar_logo.png;." --add-data "scan_success.webp;." --exclude-module PyQt5 --exclude-module torch --exclude-module scipy --exclude-module pandas --exclude-module pyarrow --exclude-module onnxruntime --exclude-module matplotlib --exclude-module botocore -y main.py
 ```
 
 ## 📝 License
