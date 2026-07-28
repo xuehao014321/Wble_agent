@@ -38,7 +38,6 @@ class ElidedLabel(QLabel):
 class ToastNotification(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.SubWindow | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
@@ -84,6 +83,7 @@ class ToastNotification(QWidget):
             # 居中显示在底部上方 50px
             self.move(parent_rect.center().x() - self.width() // 2, parent_rect.bottom() - 80)
         
+        self.raise_()
         self.show()
         self.animation.setDirection(QPropertyAnimation.Direction.Forward)
         self.animation.start()
