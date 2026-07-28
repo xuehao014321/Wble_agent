@@ -141,6 +141,7 @@ class MainWindow(QMainWindow):
         left_panel.addWidget(lbl_courses)
         
         self.course_list = QListWidget()
+        self.course_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         
         self.course_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.course_list.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -552,8 +553,8 @@ class MainWindow(QMainWindow):
                 # 使用自定义的省略号 Label，保证所有课程名只占一行且宽度自适应
                 lbl_name = ElidedLabel(course)
                 lbl_name.setStyleSheet("font-size: 13px; font-weight: 600; color: #1d1d1f; background: transparent;")
-                lbl_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-                lbl_name.setMinimumWidth(40) # 允许极限缩小
+                lbl_name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                lbl_name.setMinimumWidth(1) # 允许极限缩小
                 h_layout.addWidget(lbl_name, stretch=1)
                 
                 course_state = states.get(course, {})
@@ -586,7 +587,7 @@ class MainWindow(QMainWindow):
                 # Create QListWidgetItem
                 list_item = QListWidgetItem(self.course_list)
                 # 强制给定一个精确高度，完美包裹内部布局，解决框线越界问题
-                list_item.setSizeHint(QSize(self.course_list.width(), 62))
+                list_item.setSizeHint(QSize(0, 62))
                 list_item.setData(Qt.ItemDataRole.UserRole, course) # Store actual course name
                 
                 self.course_list.addItem(list_item)
