@@ -6,10 +6,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QLineEdit, QTextEdit, QFileDialog, QCheckBox, 
     QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem, QSlider, QComboBox,
-    QMessageBox
+    QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton
 )
-from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl
+from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QSize, QPoint
 
 from core.config import config_mgr
 from core.engine import WBLEScanner
@@ -22,6 +22,69 @@ class LogStream(QObject):
         
     def flush(self):
         pass
+
+class ToastNotification(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.SubWindow | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(15, 10, 15, 10)
+        
+        self.label = QLabel()
+        self.label.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # 绿色勾选图标
+        icon_label = QLabel("✅")
+        icon_label.setStyleSheet("font-size: 16px;")
+        
+        layout.addWidget(icon_label)
+        layout.addWidget(self.label)
+        
+        self.opacity_effect = QGraphicsOpacityEffect()
+        self.setGraphicsEffect(self.opacity_effect)
+        self.opacity_effect.setOpacity(0.0)
+        
+        self.animation = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.animation.setDuration(300)
+        
+        self.timer = QTimer()
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.hide_toast)
+        
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, self.width(), self.height(), 10, 10)
+        painter.fillPath(path, QColor(40, 40, 40, 230))
+        
+    def show_toast(self, message, duration=3000):
+        self.label.setText(message)
+        self.adjustSize()
+        if self.parent():
+            parent_rect = self.parent().rect()
+            # 居中显示在底部上方 50px
+            self.move(parent_rect.center().x() - self.width() // 2, parent_rect.bottom() - 80)
+        
+        self.show()
+        self.animation.setDirection(QPropertyAnimation.Direction.Forward)
+        self.animation.start()
+        self.timer.start(duration)
+        
+    def hide_toast(self):
+        self.animation.setDirection(QPropertyAnimation.Direction.Backward)
+        self.animation.start()
+        self.animation.finished.connect(self._on_hide_finished)
+        
+    def _on_hide_finished(self):
+        self.animation.finished.disconnect(self._on_hide_finished)
+        self.hide()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -52,11 +115,16 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(15)
         
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(self.splitter)
+        
         # === Left Panel: Courses ===
-        left_panel = QVBoxLayout()
+        self.left_panel_widget = QWidget()
+        left_panel = QVBoxLayout(self.left_panel_widget)
+        left_panel.setContentsMargins(0, 0, 0, 0)
         left_panel.setSpacing(10)
         
-        lbl_courses = QLabel("Courses Monitored\n(Double-click to open folder)")
+        lbl_courses = QLabel("Courses Monitored\n(Double-click to open)")
         lbl_courses.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f;")
         left_panel.addWidget(lbl_courses)
         
@@ -69,13 +137,32 @@ class MainWindow(QMainWindow):
         btn_remove_course.clicked.connect(self.remove_selected_course)
         left_panel.addWidget(btn_remove_course)
         
+        self.splitter.addWidget(self.left_panel_widget)
+        
         # === Center Panel: Console ===
-        center_panel = QVBoxLayout()
+        self.center_panel_widget = QWidget()
+        center_panel = QVBoxLayout(self.center_panel_widget)
+        center_panel.setContentsMargins(0, 0, 0, 0)
         center_panel.setSpacing(10)
+        
+        # Top bar of center panel (contains collapse button and title)
+        center_top_layout = QHBoxLayout()
+        
+        # 类似 Teams 的收起/展开面板按钮 (使用 Unicode 或手绘的图标)
+        self.btn_toggle_sidebar = QToolButton()
+        self.btn_toggle_sidebar.setText("◨")  # 像侧边栏的图标
+        self.btn_toggle_sidebar.setToolTip("Toggle Sidebar")
+        self.btn_toggle_sidebar.setStyleSheet("QToolButton { font-size: 20px; border: none; color: #515154; padding: 2px; border-radius: 4px; } QToolButton:hover { background-color: #e5e5ea; }")
+        self.btn_toggle_sidebar.clicked.connect(self.toggle_sidebar)
         
         lbl_console = QLabel("Activity Log")
         lbl_console.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f;")
-        center_panel.addWidget(lbl_console)
+        
+        center_top_layout.addWidget(self.btn_toggle_sidebar)
+        center_top_layout.addWidget(lbl_console)
+        center_top_layout.addStretch()
+        
+        center_panel.addLayout(center_top_layout)
         
         self.console = QTextEdit()
         self.console.setReadOnly(True)
@@ -89,8 +176,12 @@ class MainWindow(QMainWindow):
         btn_scan.clicked.connect(self.force_scan)
         center_panel.addWidget(btn_scan)
         
+        self.splitter.addWidget(self.center_panel_widget)
+        
         # === Right Panel: Settings ===
-        right_panel = QVBoxLayout()
+        self.right_panel_widget = QWidget()
+        right_panel = QVBoxLayout(self.right_panel_widget)
+        right_panel.setContentsMargins(0, 0, 0, 0)
         right_panel.setSpacing(12)
         # Header Layout
         header_layout = QHBoxLayout()
@@ -280,10 +371,29 @@ class MainWindow(QMainWindow):
         right_panel.addStretch()
         right_panel.addWidget(btn_save)
         
-        # Layout weights: 2 : 5 : 3
-        main_layout.addLayout(left_panel, 2)
-        main_layout.addLayout(center_panel, 5)
-        main_layout.addLayout(right_panel, 3)
+        # Set initial splitter sizes
+        self.splitter.setSizes([200, 500, 300])
+        
+        self.toast = ToastNotification(self)
+
+    def toggle_sidebar(self):
+        # Teams style collapse/expand using QPropertyAnimation
+        self.anim = QPropertyAnimation(self.left_panel_widget, b"maximumWidth")
+        self.anim.setDuration(250)
+        self.anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        
+        if self.left_panel_widget.maximumWidth() == 0:
+            # Expand
+            self.anim.setStartValue(0)
+            self.anim.setEndValue(350)
+            self.left_panel_widget.setMinimumWidth(150)
+        else:
+            # Collapse
+            self.left_panel_widget.setMinimumWidth(0)
+            self.anim.setStartValue(self.left_panel_widget.width())
+            self.anim.setEndValue(0)
+            
+        self.anim.start()
 
     def create_help_btn(self, title, text):
         btn = QPushButton("i")
@@ -336,14 +446,57 @@ class MainWindow(QMainWindow):
         self.course_list.clear()
         available = config_mgr.get("available_courses", [])
         blacklist = config_mgr.get("blacklisted_courses", [])
+        
+        # 加载最新的 state_db 获取状态
+        states = {}
+        if os.path.exists(self.scanner.state_file):
+            import json
+            try:
+                with open(self.scanner.state_file, "r", encoding="utf-8") as f:
+                    states = json.load(f)
+            except:
+                pass
+        
         for course in available:
             if course not in blacklist:
-                self.course_list.addItem(course)
+                # Custom widget for list item
+                item_widget = QWidget()
+                h_layout = QHBoxLayout(item_widget)
+                h_layout.setContentsMargins(5, 5, 5, 5)
+                h_layout.setSpacing(5)
+                
+                lbl_name = QLabel(course)
+                lbl_name.setStyleSheet("font-size: 13px; font-weight: 500;")
+                h_layout.addWidget(lbl_name, stretch=1)
+                
+                course_state = states.get(course, {})
+                md_ok = course_state.get("md_generated", False)
+                ics_ok = course_state.get("ics_generated", False)
+                
+                # MD Status Dot
+                lbl_md = QLabel("MD 🟢" if md_ok else "MD 🔴")
+                lbl_md.setStyleSheet("font-size: 10px; color: #86868b;")
+                lbl_md.setToolTip("MD笔记生成状态")
+                h_layout.addWidget(lbl_md)
+                
+                # ICS Status Dot
+                lbl_ics = QLabel("ICS 🟢" if ics_ok else "ICS 🔴")
+                lbl_ics.setStyleSheet("font-size: 10px; color: #86868b;")
+                lbl_ics.setToolTip("ICS日历生成状态")
+                h_layout.addWidget(lbl_ics)
+                
+                # Create QListWidgetItem
+                list_item = QListWidgetItem(self.course_list)
+                list_item.setSizeHint(item_widget.sizeHint())
+                list_item.setData(Qt.ItemDataRole.UserRole, course) # Store actual course name
+                
+                self.course_list.addItem(list_item)
+                self.course_list.setItemWidget(list_item, item_widget)
                 
     def remove_selected_course(self):
         item = self.course_list.currentItem()
         if item:
-            course = item.text()
+            course = item.data(Qt.ItemDataRole.UserRole) or item.text()
             blacklist = config_mgr.get("blacklisted_courses", [])
             if course not in blacklist:
                 blacklist.append(course)
@@ -352,7 +505,7 @@ class MainWindow(QMainWindow):
             print(f"🗑️ 已将课程移出监控列表: {course}")
 
     def open_course_folder(self, item):
-        course = item.text()
+        course = item.data(Qt.ItemDataRole.UserRole) or item.text()
         safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
         base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
         course_dir = os.path.join(base_dir, safe_course_name)
@@ -465,6 +618,8 @@ class MainWindow(QMainWindow):
                 self.refresh_course_list()
                 if updates:
                     self.tray_icon.showMessage("WBLE 有新动态！", f"发现 {len(updates)} 门课有更新，课件已下载！", QSystemTrayIcon.MessageIcon.Information, 5000)
+                # Teams style floating toast notification
+                self.toast.show_toast("🎉 WBLE 环境扫描完毕！")
         except Exception as e:
             print(f"❌ 扫描过程中发生错误: {e}")
         finally:
