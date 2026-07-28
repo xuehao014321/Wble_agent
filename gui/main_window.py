@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QLineEdit, QTextEdit, QFileDialog, QCheckBox, 
     QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem, QSlider, QComboBox,
-    QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton
+    QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton, QAbstractItemView
 )
 from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QSize, QPoint
