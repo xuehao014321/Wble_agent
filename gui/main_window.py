@@ -112,6 +112,10 @@ class MainWindow(QMainWindow):
         self.init_tray()
         self.apply_macos_dark_theme()
         
+        self.scan_timer = QTimer(self)
+        self.scan_timer.timeout.connect(self.auto_scan_trigger)
+        self.update_timer_interval()
+
         # Redirect stdout to the log widget
         self.log_stream = LogStream()
         self.log_stream.textWritten.connect(self.append_log)
@@ -401,7 +405,10 @@ class MainWindow(QMainWindow):
         lbl_interval.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 10px; font-weight: bold;")
         right_panel.addWidget(lbl_interval)
         self.cb_interval = QComboBox()
-        self.cb_interval.addItems(["Every 1 hour", "Every 4 hours", "Daily"])
+        self.cb_interval.addItems(["30 minutes", "1 hour", "4 hours", "12 hours"])
+        saved_interval = config_mgr.get("scan_interval_str", "30 minutes")
+        if saved_interval in ["30 minutes", "1 hour", "4 hours", "12 hours"]:
+            self.cb_interval.setCurrentText(saved_interval)
         right_panel.addWidget(self.cb_interval)
         
         # File Size Limit
@@ -695,10 +702,12 @@ class MainWindow(QMainWindow):
         except ValueError:
             pass
             
+        config_mgr.set("scan_interval_str", self.cb_interval.currentText())
         config_mgr.set("auto_start", self.chk_autostart.isChecked())
         config_mgr.set("setup_completed", True)
         self.preferences_saved_this_session = True
         print("💾 配置已成功保存！")
+        self.update_timer_interval()
         return True
         
     def append_log(self, text):
@@ -739,24 +748,72 @@ class MainWindow(QMainWindow):
             return
         print("\n" + "="*40)
         print("🚀 收到手动强制扫描指令，准备启动...")
-        self.scan_task = asyncio.create_task(self.run_scan_wrapper())
-        
-    async def run_scan_wrapper(self):
+        self.scan_timer.stop()
+        self.scan_task = asyncio.create_task(self.run_scan_wrapper(is_background=False))
+
+    def update_timer_interval(self):
+        interval_str = config_mgr.get("scan_interval_str", "30 minutes")
+        mapping = {
+            "30 minutes": 30 * 60 * 1000,
+            "1 hour": 60 * 60 * 1000,
+            "4 hours": 4 * 60 * 60 * 1000,
+            "12 hours": 12 * 60 * 60 * 1000
+        }
+        if interval_str not in mapping:
+            interval_str = "30 minutes"
+            config_mgr.set("scan_interval_str", interval_str)
+        ms = mapping[interval_str]
+        self.scan_timer.start(ms)
+        print(f"⏱️ 后台静默扫描定时器已更新为: {interval_str} ({ms}ms)")
+
+    def auto_scan_trigger(self):
+        if self.scan_task and not self.scan_task.done():
+            return
+
+        keys = config_mgr.get("api_keys", {})
+        if not (keys.get("openai") or keys.get("groq") or keys.get("kimi") or keys.get("gemini")):
+            return
+
+        if not config_mgr.get("setup_completed", False):
+            return
+
+        print("\n" + "="*40)
+        print("👻 [后台模式] 定时任务触发，开始静默巡逻...")
+        self.scan_timer.stop()
+        self.scan_task = asyncio.create_task(self.run_scan_wrapper(is_background=True))
+
+    async def run_scan_wrapper(self, is_background=False):
         try:
-            await self.scanner.init_browser()
-            logged_in = await self.scanner.wait_for_login()
-            if logged_in:
-                updates = await self.scanner.run_scan_cycle()
-                self.refresh_course_list()
-                if updates:
-                    self.tray_icon.showMessage("WBLE 有新动态！", f"发现 {len(updates)} 门课有更新，课件已下载！", QSystemTrayIcon.MessageIcon.Information, 5000)
-                # Teams style floating toast notification
+            await self.scanner.init_browser(is_background=is_background)
+            logged_in = await self.scanner.wait_for_login(is_background=is_background)
+            if not logged_in:
+                if is_background:
+                    self.tray_icon.showMessage(
+                        "WBLE 登录已过期",
+                        "请打开主界面并点击一次 Force Scan 重新授权。",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        8000
+                    )
+                return
+
+            updates = await self.scanner.run_scan_cycle()
+            self.refresh_course_list()
+            if updates:
+                self.tray_icon.showMessage("WBLE 有新动态！", f"发现 {len(updates)} 门课有更新，课件已下载！", QSystemTrayIcon.MessageIcon.Information, 5000)
+            if not is_background:
+                # 手动扫描才显示界面内浮层，后台无更新时保持完全静默。
                 self.toast.show_toast("🎉 WBLE 环境扫描完毕！")
         except Exception as e:
             print(f"❌ 扫描过程中发生错误: {e}")
         finally:
-            await self.scanner.cleanup()
-            print("🛑 浏览器引擎已安全释放。")
+            try:
+                await self.scanner.cleanup()
+                print("🛑 浏览器引擎已安全释放。")
+            except Exception as cleanup_error:
+                print(f"⚠️ 浏览器引擎清理失败: {cleanup_error}")
+            finally:
+                # 无论成功、失败或登录过期，均从本轮结束时重新完整倒计时。
+                self.update_timer_interval()
 
     def apply_macos_dark_theme(self):
         # Premium Minimalist White Light Mode (macOS Big Sur+ inspired)

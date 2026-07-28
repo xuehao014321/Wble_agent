@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "download_dir": os.path.join(os.getcwd(), "WBLE_Downloads"),
     "max_file_size_mb": 50,
     "scan_interval_hours": 1,
+    "scan_interval_str": "30 minutes",
     "auto_start": False,
     "blacklisted_courses": [],
     "theme": "dark"

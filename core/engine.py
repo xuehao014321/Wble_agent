@@ -19,6 +19,7 @@ if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 TARGET_URL = "https://wble.utar.edu.my/"
+AUTH_STATE_FILE = os.path.join(os.getcwd(), "wble_auth_state.json")
 
 # ================= 工具函数 =================
 
@@ -481,14 +482,14 @@ class WBLEScanner:
         self.context = None
         self.page = None
         
-    async def init_browser(self):
-        print("🤖 初始化浏览器引擎...", flush=True)
+    async def init_browser(self, is_background=False):
+        print(f"🤖 初始化浏览器引擎 (后台模式={is_background})...", flush=True)
         self.playwright = await async_playwright().start()
         user_data_dir = os.path.join(os.getcwd(), "chrome_data")
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=False,
+                headless=is_background,
                 channel="chrome",
                 ignore_https_errors=True
             )
@@ -498,20 +499,44 @@ class WBLEScanner:
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=False,
+                headless=is_background,
                 ignore_https_errors=True
             )
+
+        if is_background and os.path.exists(AUTH_STATE_FILE):
+            try:
+                with open(AUTH_STATE_FILE, "r", encoding="utf-8") as auth_file:
+                    auth_state = json.load(auth_file)
+                cookies = auth_state.get("cookies", [])
+                if cookies:
+                    await self.context.add_cookies(cookies)
+                    print(f"🔐 已载入 {len(cookies)} 个已保存的登录 Cookie。", flush=True)
+            except Exception as e:
+                print(f"⚠️ 无法载入已保存的登录状态: {e}", flush=True)
+
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         
-    async def wait_for_login(self):
-        await self.page.goto(TARGET_URL)
-        print("\n" + "❗"*25, flush=True)
-        print("🛑 登录状态检查：", flush=True)
-        print("👉 请在浏览器里选择校区并完成登录，登录成功后脚本会自动开始工作！", flush=True)
-        print("👉 ⚠️ 温馨提示：选择校区后会弹出新标签页，属于正常现象，请在新标签页完成登录！", flush=True)
-        print("❗"*25 + "\n", flush=True)
-        
-        for _ in range(600):
+    async def wait_for_login(self, is_background=False):
+        if is_background:
+            # 后台没有用户可以选择校区，因此必须直接进入上次登录成功后
+            # 保存下来的校区主页，不能从 WBLE 公共入口开始。
+            login_check_url = config_mgr.get("dashboard_url", TARGET_URL)
+            print(f"👻 正在后台验证已保存的 WBLE 会话: {login_check_url}", flush=True)
+        else:
+            login_check_url = TARGET_URL
+            print("\n" + "❗"*25, flush=True)
+            print("🛑 登录状态检查：", flush=True)
+            print("👉 请在浏览器里选择校区并完成登录，登录成功后脚本会自动开始工作！", flush=True)
+            print("👉 ⚠️ 温馨提示：选择校区后会弹出新标签页，属于正常现象，请在新标签页完成登录！", flush=True)
+            print("❗"*25 + "\n", flush=True)
+
+        await self.page.goto(login_check_url, wait_until="domcontentloaded")
+
+        # 后台给网络和页面脚本 15 秒完成跳转与渲染；手动模式仍允许
+        # 用户在 10 分钟内完成校区选择及身份验证。
+        max_retries = 15 if is_background else 600
+
+        for _ in range(max_retries):
             # 关键修复：监控 context 里所有标签页，而不只是初始页
             all_pages = self.context.pages
             for p in all_pages:
@@ -525,12 +550,20 @@ class WBLEScanner:
                         if logout_count > 0 or course_count > 0:
                             print("\n✅ 已自动检测到登录成功！", flush=True)
                             config_mgr.set("dashboard_url", current_url)
+                            await self.context.storage_state(path=AUTH_STATE_FILE)
+                            print("🔐 登录状态已安全保存，供下次后台巡逻使用。", flush=True)
                             self.page = p  # 切换主控页面到登录成功的那个标签页
                             return True
                     except Exception:
                         pass
             await asyncio.sleep(1)
-        print("⚠️ 登录检测超时，请重试。", flush=True)
+
+        if is_background:
+            final_urls = ", ".join(p.url for p in self.context.pages)
+            print(f"🔎 后台登录检测最终页面: {final_urls}", flush=True)
+            print("⚠️ 幽灵模式检测到需要登录，终止后台扫描，请用户手动 Force Scan 授权。", flush=True)
+        else:
+            print("⚠️ 登录检测超时，请重试。", flush=True)
         return False
 
         
@@ -675,7 +708,15 @@ class WBLEScanner:
         return updates_found
 
     async def cleanup(self):
-        if self.context:
-            await self.context.close()
-        if self.playwright:
-            await self.playwright.stop()
+        context = self.context
+        playwright = self.playwright
+        self.context = None
+        self.playwright = None
+        self.page = None
+
+        try:
+            if context:
+                await context.close()
+        finally:
+            if playwright:
+                await playwright.stop()
