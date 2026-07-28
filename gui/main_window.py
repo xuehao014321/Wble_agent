@@ -26,9 +26,14 @@ class LogStream(QObject):
 class ElidedLabel(QLabel):
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         metrics = self.fontMetrics()
         elided = metrics.elidedText(self.text(), Qt.TextElideMode.ElideRight, self.width())
-        painter.drawText(self.rect(), self.alignment(), elided)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+        
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
 
 class ToastNotification(QWidget):
     def __init__(self, parent=None):
@@ -136,6 +141,28 @@ class MainWindow(QMainWindow):
         left_panel.addWidget(lbl_courses)
         
         self.course_list = QListWidget()
+        
+        self.course_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.course_list.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.course_list.setStyleSheet("""
+            QListWidget {
+                border: none;
+                background-color: transparent;
+                outline: none; /* 去除原生虚线框 */
+            }
+            QListWidget::item {
+                border-radius: 8px;
+                margin: 2px 8px; /* 卡片两边留白 */
+            }
+            QListWidget::item:selected {
+                background-color: #E5E5EA; /* 类似 Mac 的柔和灰背景 */
+                color: #1d1d1f;
+            }
+            QListWidget::item:hover {
+                background-color: #F2F2F7;
+            }
+        """)
+        
         self.refresh_course_list()
         self.course_list.itemDoubleClicked.connect(self.open_course_folder)
         left_panel.addWidget(self.course_list)
@@ -518,14 +545,15 @@ class MainWindow(QMainWindow):
             if course not in blacklist:
                 # Custom widget for list item
                 item_widget = QWidget()
-                item_widget.setMinimumHeight(48)  # 统一固定的精美高度
                 h_layout = QHBoxLayout(item_widget)
-                h_layout.setContentsMargins(8, 6, 8, 6)
-                h_layout.setSpacing(8)
+                h_layout.setContentsMargins(10, 6, 10, 6)
+                h_layout.setSpacing(12)
                 
                 # 使用自定义的省略号 Label，保证所有课程名只占一行且宽度自适应
                 lbl_name = ElidedLabel(course)
-                lbl_name.setStyleSheet("font-size: 13px; font-weight: 600; color: #1d1d1f;")
+                lbl_name.setStyleSheet("font-size: 13px; font-weight: 600; color: #1d1d1f; background: transparent;")
+                lbl_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+                lbl_name.setMinimumWidth(40) # 允许极限缩小
                 h_layout.addWidget(lbl_name, stretch=1)
                 
                 course_state = states.get(course, {})
@@ -534,24 +562,31 @@ class MainWindow(QMainWindow):
                 
                 # 状态栏 (垂直排列)
                 status_layout = QVBoxLayout()
-                status_layout.setSpacing(2)
+                status_layout.setSpacing(4)
+                status_layout.setContentsMargins(0, 4, 0, 4)
                 
-                lbl_md = QLabel("MD 🟢" if md_ok else "MD 🔴")
-                lbl_md.setStyleSheet("font-size: 10px; color: #86868b;")
-                lbl_md.setToolTip("MD笔记生成状态")
+                def create_badge(text, is_success):
+                    lbl = QLabel(text)
+                    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    lbl.setFixedSize(36, 18)
+                    if is_success:
+                        lbl.setStyleSheet("background-color: #E6F4EA; color: #137333; border-radius: 9px; font-size: 10px; font-weight: 700;")
+                    else:
+                        lbl.setStyleSheet("background-color: #FCE8E6; color: #C5221F; border-radius: 9px; font-size: 10px; font-weight: 700;")
+                    return lbl
                 
-                lbl_ics = QLabel("ICS 🟢" if ics_ok else "ICS 🔴")
-                lbl_ics.setStyleSheet("font-size: 10px; color: #86868b;")
-                lbl_ics.setToolTip("ICS日历生成状态")
+                lbl_md = create_badge("MD", md_ok)
+                lbl_ics = create_badge("ICS", ics_ok)
                 
                 status_layout.addWidget(lbl_md)
                 status_layout.addWidget(lbl_ics)
                 
-                h_layout.addLayout(status_layout)
+                h_layout.addLayout(status_layout, stretch=0) # 坚守宽度，不被挤压
                 
                 # Create QListWidgetItem
                 list_item = QListWidgetItem(self.course_list)
-                list_item.setSizeHint(item_widget.sizeHint())
+                # 强制给定一个精确高度，完美包裹内部布局，解决框线越界问题
+                list_item.setSizeHint(QSize(self.course_list.width(), 62))
                 list_item.setData(Qt.ItemDataRole.UserRole, course) # Store actual course name
                 
                 self.course_list.addItem(list_item)
