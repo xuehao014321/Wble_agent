@@ -87,7 +87,19 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
     except Exception as e:
         print(f"      ⚠️ Azure 主引擎已枯竭 (触发限制): {type(e).__name__}", flush=True)
 
-    # 2. Gemini (备用引擎，不花钱)
+    # 2. Groq (免费高速引擎)
+    try:
+        groq_key = config_mgr.get("api_keys", {}).get("groq", "")
+        if groq_key:
+            print("   🤖 [AI 引擎] 启动备用引擎: Groq (Llama 3)...", flush=True)
+            llm = ChatOpenAI(model="llama-3.3-70b-versatile", api_key=groq_key, base_url="https://api.groq.com/openai/v1", temperature=0.1)
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
+    except Exception as e:
+        print(f"      ⚠️ Groq 引擎调用失败: {type(e).__name__}", flush=True)
+
+    # 3. Gemini (备用引擎，不花钱)
     try:
         print("   🤖 [AI 引擎] 启动备用引擎: Gemini 3.5 Flash...", flush=True)
         from google import genai
@@ -175,6 +187,41 @@ async def generate_initial_archive(course_name, text_content, course_dir):
             f.write(f"# {course_name}\n")
             f.write(f"*归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
             f.write(result_content)
+            
+        print(f"   📅 正在提取【{course_name}】的日程安排并生成日历...", flush=True)
+        ics_prompt = PromptTemplate.from_template(
+            "你是一个严格的日历生成器。请阅读以下已经为你精简好的【课程重点笔记】，提取其中所有需要学生【去参加/去完成】的有明确日期时间的事件。\n\n"
+            "【包含类型】:\n"
+            "1. 所有的作业截止日期 (Deadline)\n"
+            "2. 考试 (Exams) & 测验 (Quiz & Test)\n"
+            "3. 补课 (Replacement Classes) 或 加课 (Additional Classes) - 请具体写明具体时间和教室 (如有)\n\n"
+            "【禁止包含类型】:\n"
+            "1. 纯粹的「课堂取消/停课」(Canceled Class) - 除非伴随有明确的补课时间安排（此时只保留并写入补课日程）\n\n"
+            "如果没有找到任何符合「包含类型」的明确日期事件，请直接回复：NONE\n\n"
+            "如果找到了，请务必直接输出标准 iCalendar (.ics) 格式的内容，不需要任何额外解释。请参照以下模板：\n"
+            "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//WBLE Agent//EN\n"
+            "BEGIN:VEVENT\nSUMMARY:Assignment 1\nDTSTART:20260810T150000Z\nDTEND:20260810T160000Z\nEND:VEVENT\n"
+            "END:VCALENDAR\n\n"
+            "注意：如果没有具体结束时间，可以默认结束时间比开始时间晚一小时。如果只有日期没有具体时间，可以默认为当地时间中午12点。必须输出标准的 ics 文本格式。\n\n"
+            "【课程重点笔记】:\n{web_content}"
+        )
+        try:
+            ics_content = await invoke_llm_with_fallback(ics_prompt, {"web_content": result_content})
+            ics_content = ics_content.strip()
+            
+            # 使用正则严格提取日历文本块，无视大模型生成的啰嗦废话
+            match = re.search(r'(BEGIN:VCALENDAR.*?END:VCALENDAR)', ics_content, re.DOTALL | re.IGNORECASE)
+            
+            if match:
+                ics_path = os.path.join(course_dir, "Reminder.ics")
+                with open(ics_path, "w", encoding="utf-8") as f:
+                    f.write(match.group(1).strip())
+                print("   ✅ 日历文件 Reminder.ics 生成成功！", flush=True)
+            else:
+                print("   ℹ️ 未在课件主页发现具体的截止日期，跳过日历生成。", flush=True)
+        except Exception as e:
+            print(f"   ⚠️ 日历生成失败: {e}", flush=True)
+            
         return True  # 成功
     except Exception:
         print(f"   ⚠️ 笔记生成跳过 (所有大模型引擎均失败或无额度)。", flush=True)
