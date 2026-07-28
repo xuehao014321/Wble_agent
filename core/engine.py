@@ -398,22 +398,17 @@ async def deep_scan_course(page, course_link, course_dir, state_db, course_name)
     await page.goto(course_link, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
     
-    # 尝试仅抓取主要课程区域，避免侧边栏（最新活动、在线用户、时间戳）导致频繁的 Hash 误报
+    # 只严格抓取中间内容区，坚决拒绝抓取全网页 (body)，防止侧边栏的时间戳/在线人数导致 Hash 频繁变动
     text_content = ""
-    # 优先匹配 middle-column (WBLE经典主题结构)，再匹配 region-main (Moodle新版Boost主题)
-    for selector in ["#middle-column", ".middle-column", "#region-main", ".course-content", "[role='main']", "body"]:
-        locator = page.locator(selector).first
-        try:
-            if await locator.is_visible():
-                text_content = await locator.inner_text()
-                break
-        except Exception:
-            continue
-            
+    locator = page.locator("#middle-column").first
+    try:
+        if await locator.is_visible():
+            text_content = await locator.inner_text()
+    except Exception:
+        pass
+        
     if not text_content:
-        text_content = await page.inner_text("body")
-    
-    
+        print(f"      ⚠️ 警告: 无法在【{course_name}】找到标准内容区(#middle-column)，提取内容可能为空！", flush=True)
     # 抓取页面中的外部会议/文档链接，注入到纯文本供大模型分析
     external_links = await page.evaluate('''() => {
         const keywords = ['teams.microsoft', 'docs.google', 'drive.google', 'zoom.us', 'webex', 'meet.google', 'chat.whatsapp'];
