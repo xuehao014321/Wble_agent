@@ -148,11 +148,22 @@ class MainWindow(QMainWindow):
         # Top bar of center panel (contains collapse button and title)
         center_top_layout = QHBoxLayout()
         
-        # 类似 Teams 的收起/展开面板按钮 (使用 Unicode 或手绘的图标)
+        # 类似 Teams 的收起/展开面板按钮
         self.btn_toggle_sidebar = QToolButton()
-        self.btn_toggle_sidebar.setText("◨")  # 像侧边栏的图标
+        # 创建一个 SVG 图标
+        sidebar_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#515154" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="9" y1="3" x2="9" y2="21"></line>
+        </svg>"""
+        import tempfile
+        svg_path = os.path.join(tempfile.gettempdir(), "sidebar_icon.svg")
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write(sidebar_svg)
+        
+        self.btn_toggle_sidebar.setIcon(QIcon(svg_path))
+        self.btn_toggle_sidebar.setIconSize(QSize(20, 20))
         self.btn_toggle_sidebar.setToolTip("Toggle Sidebar")
-        self.btn_toggle_sidebar.setStyleSheet("QToolButton { font-size: 20px; border: none; color: #515154; padding: 2px; border-radius: 4px; } QToolButton:hover { background-color: #e5e5ea; }")
+        self.btn_toggle_sidebar.setStyleSheet("QToolButton { border: none; padding: 4px; border-radius: 6px; } QToolButton:hover { background-color: #e5e5ea; }")
         self.btn_toggle_sidebar.clicked.connect(self.toggle_sidebar)
         
         lbl_console = QLabel("Activity Log")
@@ -371,8 +382,18 @@ class MainWindow(QMainWindow):
         right_panel.addStretch()
         right_panel.addWidget(btn_save)
         
+        self.splitter.addWidget(self.right_panel_widget)
+        
+        # Style the splitter handle to be subtle
+        self.splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: transparent;
+                margin: 0px 5px;
+            }
+        """)
+        
         # Set initial splitter sizes
-        self.splitter.setSizes([200, 500, 300])
+        self.splitter.setSizes([250, 500, 300])
         
         self.toast = ToastNotification(self)
 
