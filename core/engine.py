@@ -164,7 +164,7 @@ async def categorize_file_with_ai(filename, link_text):
         return "Others", False  # AI 调用失败，标记为未成功
 
 
-async def generate_initial_archive(course_name, text_content, course_dir):
+async def generate_md_archive(course_name, text_content, course_dir):
     print(f"   📝 正在让大模型提炼【{course_name}】的极致精简笔记...", flush=True)
     try:
         prompt = PromptTemplate.from_template(
@@ -187,45 +187,59 @@ async def generate_initial_archive(course_name, text_content, course_dir):
             f.write(f"# {course_name}\n")
             f.write(f"*归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
             f.write(result_content)
-            
-        print(f"   📅 正在提取【{course_name}】的日程安排并生成日历...", flush=True)
-        ics_prompt = PromptTemplate.from_template(
-            "你是一个严格的日历生成器。请阅读以下已经为你精简好的【课程重点笔记】，提取其中所有需要学生【去参加/去完成】的有明确日期时间的事件。\n\n"
-            "【包含类型】:\n"
-            "1. 所有的作业截止日期 (Deadline)\n"
-            "2. 考试 (Exams) & 测验 (Quiz & Test)\n"
-            "3. 补课 (Replacement Classes) 或 加课 (Additional Classes) - 请具体写明具体时间和教室 (如有)\n\n"
-            "【禁止包含类型】:\n"
-            "1. 纯粹的「课堂取消/停课」(Canceled Class) - 除非伴随有明确的补课时间安排（此时只保留并写入补课日程）\n\n"
-            "如果没有找到任何符合「包含类型」的明确日期事件，请直接回复：NONE\n\n"
-            "如果找到了，请务必直接输出标准 iCalendar (.ics) 格式的内容，不需要任何额外解释。请参照以下模板：\n"
-            "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//WBLE Agent//EN\n"
-            "BEGIN:VEVENT\nSUMMARY:Assignment 1\nDTSTART:20260810T150000Z\nDTEND:20260810T160000Z\nEND:VEVENT\n"
-            "END:VCALENDAR\n\n"
-            "注意：如果没有具体结束时间，可以默认结束时间比开始时间晚一小时。如果只有日期没有具体时间，可以默认为当地时间中午12点。必须输出标准的 ics 文本格式。\n\n"
-            "【课程重点笔记】:\n{web_content}"
-        )
-        try:
-            ics_content = await invoke_llm_with_fallback(ics_prompt, {"web_content": result_content})
-            ics_content = ics_content.strip()
-            
-            # 使用正则严格提取日历文本块，无视大模型生成的啰嗦废话
-            match = re.search(r'(BEGIN:VCALENDAR.*?END:VCALENDAR)', ics_content, re.DOTALL | re.IGNORECASE)
-            
-            if match:
-                ics_path = os.path.join(course_dir, "Reminder.ics")
-                with open(ics_path, "w", encoding="utf-8") as f:
-                    f.write(match.group(1).strip())
-                print("   ✅ 日历文件 Reminder.ics 生成成功！", flush=True)
-            else:
-                print("   ℹ️ 未在课件主页发现具体的截止日期，跳过日历生成。", flush=True)
-        except Exception as e:
-            print(f"   ⚠️ 日历生成失败: {e}", flush=True)
-            
+        
         return True  # 成功
     except Exception:
         print(f"   ⚠️ 笔记生成跳过 (所有大模型引擎均失败或无额度)。", flush=True)
         return False  # 失败，需要下次重试
+
+async def generate_ics_calendar(course_name, course_dir):
+    md_file_path = os.path.join(course_dir, "课程重点归档.md")
+    if not os.path.exists(md_file_path):
+        return False  # 必须先有 MD 才能生成 ICS
+        
+    with open(md_file_path, "r", encoding="utf-8") as f:
+        result_content = f.read()
+        
+    print(f"   📅 正在提取【{course_name}】的日程安排并生成日历...", flush=True)
+    ics_prompt = PromptTemplate.from_template(
+        "你是一个严格的日历生成器。请阅读以下已经为你精简好的【课程重点笔记】，提取其中所有需要学生【去参加/去完成】的有明确日期时间的事件。\n\n"
+        "【包含类型】:\n"
+        "1. 所有的作业截止日期 (Deadline)\n"
+        "2. 考试 (Exams) & 测验 (Quiz & Test)\n"
+        "3. 补课 (Replacement Classes) 或 加课 (Additional Classes) - 请具体写明具体时间和教室 (如有)\n\n"
+        "【禁止包含类型】:\n"
+        "1. 纯粹的「课堂取消/停课」(Canceled Class) - 除非伴随有明确的补课时间安排（此时只保留并写入补课日程）\n\n"
+        "如果没有找到任何符合「包含类型」的明确日期事件，请直接回复：NONE\n\n"
+        "如果找到了，请务必直接输出标准 iCalendar (.ics) 格式的内容，不需要任何额外解释。请参照以下模板：\n"
+        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//WBLE Agent//EN\n"
+        "BEGIN:VEVENT\nSUMMARY:Assignment 1\nDTSTART:20260810T150000Z\nDTEND:20260810T160000Z\nEND:VEVENT\n"
+        "END:VCALENDAR\n\n"
+        "注意：如果没有具体结束时间，可以默认结束时间比开始时间晚一小时。如果只有日期没有具体时间，可以默认为当地时间中午12点。必须输出标准的 ics 文本格式。\n\n"
+        "【课程重点笔记】:\n{web_content}"
+    )
+    try:
+        ics_content = await invoke_llm_with_fallback(ics_prompt, {"web_content": result_content})
+        ics_content = ics_content.strip()
+        
+        # 使用正则严格提取日历文本块，无视大模型生成的啰嗦废话
+        match = re.search(r'(BEGIN:VCALENDAR.*?END:VCALENDAR)', ics_content, re.DOTALL | re.IGNORECASE)
+        ics_path = os.path.join(course_dir, "Reminder.ics")
+        
+        if match:
+            with open(ics_path, "w", encoding="utf-8") as f:
+                f.write(match.group(1).strip())
+            print("   ✅ 日历文件 Reminder.ics 生成/更新成功！", flush=True)
+        else:
+            print("   ℹ️ 检查完毕，当前无明确日程，不需要日历文件。", flush=True)
+            if os.path.exists(ics_path):
+                os.remove(ics_path)
+                print("   🗑️ 已自动清理过期的 Reminder.ics。", flush=True)
+                
+        return True  # 成功调用了 API 无论是否有日程
+    except Exception as e:
+        print(f"   ⚠️ 日历生成失败，稍后自动重试。({e})", flush=True)
+        return False
 
 
 def smart_categorize_local(filename, link_text):
@@ -544,16 +558,21 @@ class WBLEScanner:
                 
                 # 确保旧 state 也有新字段（兼容之前的用户数据）
                 if name not in state_db:
-                    state_db[name] = {"hash": "", "downloaded_files": [], "md_generated": False, "has_unclassified_files": False}
+                    state_db[name] = {"hash": "", "downloaded_files": [], "md_generated": False, "ics_generated": False, "has_unclassified_files": False}
                 else:
                     state_db[name].setdefault("md_generated", False)
+                    state_db[name].setdefault("ics_generated", False)
                     state_db[name].setdefault("has_unclassified_files", False)
 
                 if state_db[name]["hash"] == "":  # 真正初次扫描
                     print(f"   [初次识别] 激活大模型归档与深潜下载模式！", flush=True)
                     new_files, text_content = await deep_scan_course(self.page, link, course_dir, state_db, name)
-                    md_ok = await generate_initial_archive(name, text_content, course_dir)
+                    md_ok = await generate_md_archive(name, text_content, course_dir)
                     state_db[name]["md_generated"] = md_ok
+                    
+                    if md_ok:
+                        ics_ok = await generate_ics_calendar(name, course_dir)
+                        state_db[name]["ics_generated"] = ics_ok
                     current_hash = get_text_hash(text_content)
                     state_db[name]["hash"] = current_hash
                     print(f"   🎉 归档完毕！本次深潜共挖出 {new_files} 份文件。", flush=True)
@@ -569,6 +588,9 @@ class WBLEScanner:
                             "files_count": new_files
                         })
                         state_db[name]["hash"] = current_hash
+                        # 内容有更新，强制重新生成笔记和日历
+                        state_db[name]["md_generated"] = False
+                        state_db[name]["ics_generated"] = False
                     elif new_files > 0:
                         print(f"   📦 网页文字虽未变，但在子文件夹深潜抓到了 {new_files} 份新课件！", flush=True)
                         updates_found.append({
@@ -584,12 +606,19 @@ class WBLEScanner:
                 need_md = not state_db[name].get("md_generated", False) or not os.path.exists(md_path)
                 if need_md and text_content:
                     print(f"   🔄 [自愈] MD 归档缺失或上次生成失败，正在重新生成...", flush=True)
-                    md_ok = await generate_initial_archive(name, text_content, course_dir)
+                    md_ok = await generate_md_archive(name, text_content, course_dir)
                     state_db[name]["md_generated"] = md_ok
                     if md_ok:
                         print(f"   ✅ [自愈] MD 归档补全成功！", flush=True)
                     else:
                         print(f"   ⚠️ [自愈] MD 生成仍然失败，请检查 API Key 配置，下次会继续重试。", flush=True)
+
+                # ── 自愈机制 1.5：ICS 日历（仅当 MD 存在且 ICS 未成功时触发）────────
+                need_ics = not state_db[name].get("ics_generated", False)
+                if need_ics and os.path.exists(md_path):
+                    print(f"   🔄 [自愈] ICS 日历未同步，正在自动对齐更新...", flush=True)
+                    ics_ok = await generate_ics_calendar(name, course_dir)
+                    state_db[name]["ics_generated"] = ics_ok
 
                 # ── 自愈机制 2：Others 重分类（状态感知 + 文件系统双保险）──
                 others_dir = os.path.join(course_dir, "Files", "Others")
