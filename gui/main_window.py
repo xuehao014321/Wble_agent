@@ -597,12 +597,44 @@ class MainWindow(QMainWindow):
         item = self.course_list.currentItem()
         if item:
             course = item.data(Qt.ItemDataRole.UserRole) or item.text()
+            
+            # 确认弹窗
+            reply = QMessageBox.question(
+                self, "确认删除", 
+                f"确定要移除课程【{course}】吗？\n\n注意：这将会连同本地已下载的该课件文件夹一起彻底删除，不可恢复！",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
             blacklist = config_mgr.get("blacklisted_courses", [])
             if course not in blacklist:
                 blacklist.append(course)
                 config_mgr.set("blacklisted_courses", blacklist)
+                
+            # 清理 state_db
+            state_db = config_mgr.state
+            if course in state_db:
+                del state_db[course]
+                config_mgr.state = state_db
+                
+            # 清除本地文件夹
+            import shutil
+            safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
+            base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
+            course_dir = os.path.join(base_dir, safe_course_name)
+            
+            if os.path.exists(course_dir):
+                try:
+                    shutil.rmtree(course_dir)
+                    print(f"🗑️ 已成功删除本地文件夹: {course_dir}")
+                except Exception as e:
+                    print(f"⚠️ 删除文件夹失败 {course_dir}: {e}")
+                    
             self.refresh_course_list()
-            print(f"🗑️ 已将课程移出监控列表: {course}")
+            print(f"✅ 已将课程移出监控列表并清理所有本地数据: {course}")
 
     def open_course_folder(self, item):
         course = item.data(Qt.ItemDataRole.UserRole) or item.text()
