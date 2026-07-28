@@ -23,6 +23,13 @@ class LogStream(QObject):
     def flush(self):
         pass
 
+class ElidedLabel(QLabel):
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        metrics = self.fontMetrics()
+        elided = metrics.elidedText(self.text(), Qt.TextElideMode.ElideRight, self.width())
+        painter.drawText(self.rect(), self.alignment(), elided)
+
 class ToastNotification(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -511,31 +518,36 @@ class MainWindow(QMainWindow):
             if course not in blacklist:
                 # Custom widget for list item
                 item_widget = QWidget()
-                item_widget.setMinimumHeight(44)  # 强制最小高度，防止排版被裁切
+                item_widget.setMinimumHeight(48)  # 统一固定的精美高度
                 h_layout = QHBoxLayout(item_widget)
-                h_layout.setContentsMargins(8, 8, 8, 8)
-                h_layout.setSpacing(5)
+                h_layout.setContentsMargins(8, 6, 8, 6)
+                h_layout.setSpacing(8)
                 
-                lbl_name = QLabel(course)
-                lbl_name.setStyleSheet("font-size: 13px; font-weight: 500;")
-                lbl_name.setWordWrap(True)  # 允许文字换行，防止宽度过窄时压缩高度
+                # 使用自定义的省略号 Label，保证所有课程名只占一行且宽度自适应
+                lbl_name = ElidedLabel(course)
+                lbl_name.setStyleSheet("font-size: 13px; font-weight: 600; color: #1d1d1f;")
                 h_layout.addWidget(lbl_name, stretch=1)
                 
                 course_state = states.get(course, {})
                 md_ok = course_state.get("md_generated", False)
                 ics_ok = course_state.get("ics_generated", False)
                 
-                # MD Status Dot
+                # 状态栏 (垂直排列)
+                status_layout = QVBoxLayout()
+                status_layout.setSpacing(2)
+                
                 lbl_md = QLabel("MD 🟢" if md_ok else "MD 🔴")
                 lbl_md.setStyleSheet("font-size: 10px; color: #86868b;")
                 lbl_md.setToolTip("MD笔记生成状态")
-                h_layout.addWidget(lbl_md)
                 
-                # ICS Status Dot
                 lbl_ics = QLabel("ICS 🟢" if ics_ok else "ICS 🔴")
                 lbl_ics.setStyleSheet("font-size: 10px; color: #86868b;")
                 lbl_ics.setToolTip("ICS日历生成状态")
-                h_layout.addWidget(lbl_ics)
+                
+                status_layout.addWidget(lbl_md)
+                status_layout.addWidget(lbl_ics)
+                
+                h_layout.addLayout(status_layout)
                 
                 # Create QListWidgetItem
                 list_item = QListWidgetItem(self.course_list)
