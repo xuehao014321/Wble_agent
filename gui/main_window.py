@@ -448,14 +448,7 @@ class MainWindow(QMainWindow):
         blacklist = config_mgr.get("blacklisted_courses", [])
         
         # 加载最新的 state_db 获取状态
-        states = {}
-        if os.path.exists(self.scanner.state_file):
-            import json
-            try:
-                with open(self.scanner.state_file, "r", encoding="utf-8") as f:
-                    states = json.load(f)
-            except:
-                pass
+        states = config_mgr.state
         
         for course in available:
             if course not in blacklist:
