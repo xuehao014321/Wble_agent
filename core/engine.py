@@ -398,15 +398,18 @@ async def deep_scan_course(page, course_link, course_dir, state_db, course_name)
     await page.goto(course_link, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
     
-    # 只严格抓取中间内容区，坚决拒绝抓取全网页 (body)，防止侧边栏的时间戳/在线人数导致 Hash 频繁变动
+    # 只严格抓取中间内容区，坚决拒绝抓取全网页 (body)
     text_content = ""
-    locator = page.locator("#middle-column").first
     try:
-        if await locator.is_visible():
-            text_content = await locator.inner_text()
+        # Playwright 的 inner_text 自带自动等待机制，比手动的 is_visible 更可靠
+        text_content = await page.inner_text("#middle-column", timeout=5000)
     except Exception:
-        pass
-        
+        try:
+            # 兼容有些课程可能使用 .course-content 包装
+            text_content = await page.inner_text(".course-content", timeout=2000)
+        except Exception:
+            pass
+            
     if not text_content:
         print(f"      ⚠️ 警告: 无法在【{course_name}】找到标准内容区(#middle-column)，提取内容可能为空！", flush=True)
     # 抓取页面中的外部会议/文档链接，注入到纯文本供大模型分析
