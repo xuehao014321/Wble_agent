@@ -33,7 +33,13 @@ venv.bak/
 chrome_data/
 wble_auth_state.json
 wble_config.json
+wble_config.json.bak
 wble_state.json
+wble_state.json.bak
 WBLE_Downloads/
 config.json
 *.log
+*.log.*
+*.tmp
+scan_success.gif
+upload_release.py

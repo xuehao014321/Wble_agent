@@ -7,10 +7,16 @@ import json
 import hashlib
 import difflib
 import re
+import sqlite3
+import pathlib
+import uuid
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from email.message import Message
+from email.utils import collapse_rfc2231_value
+from datetime import datetime, timezone
 from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from core.config import config_mgr
@@ -29,7 +35,7 @@ VOLATILE_QUERY_PARAMS = {
 
 # ================= 工具函数 =================
 
-def send_wechat_notification(title, desp):
+async def send_wechat_notification(title, desp):
     serverchan_key = config_mgr.get("serverchan_key", "")
     if not serverchan_key:
         return
@@ -38,13 +44,93 @@ def send_wechat_notification(title, desp):
     data = urllib.parse.urlencode({'title': title, 'desp': desp}).encode('utf-8')
     req = urllib.request.Request(url, data=data)
     try:
-        urllib.request.urlopen(req)
+        await asyncio.to_thread(
+            lambda: urllib.request.urlopen(req, timeout=20).read()
+        )
         print("✅ 微信推送成功！", flush=True)
     except Exception as e:
         print(f"❌ 微信推送失败: {e}", flush=True)
 
 def get_text_hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def atomic_write_text(path, text):
+    temp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def chunk_text_by_lines(text, max_chars=12000):
+    chunks = []
+    current_lines = []
+    current_length = 0
+    for line in str(text or "").splitlines():
+        line_length = len(line) + 1
+        if current_lines and current_length + line_length > max_chars:
+            chunks.append("\n".join(current_lines))
+            current_lines = []
+            current_length = 0
+        current_lines.append(line)
+        current_length += line_length
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks or [""]
+
+
+def has_saved_wble_credentials(user_data_dir):
+    """
+    Check whether Chrome has a saved UTAR login without reading or decrypting
+    the username/password values.
+    """
+    profile_dirs = [os.path.join(user_data_dir, "Default")]
+    try:
+        profile_dirs.extend(
+            os.path.join(user_data_dir, name)
+            for name in os.listdir(user_data_dir)
+            if name.startswith("Profile ")
+        )
+    except OSError:
+        pass
+
+    for profile_dir in profile_dirs:
+        for database_name in ("Login Data", "Login Data For Account"):
+            database_path = os.path.join(profile_dir, database_name)
+            if not os.path.isfile(database_path):
+                continue
+            try:
+                database_uri = (
+                    pathlib.Path(database_path).resolve().as_uri() + "?mode=ro"
+                )
+                with sqlite3.connect(database_uri, uri=True, timeout=1) as database:
+                    found = database.execute(
+                        """
+                        SELECT 1
+                        FROM logins
+                        WHERE blacklisted_by_user = 0
+                          AND length(password_value) > 0
+                          AND (
+                              instr(lower(origin_url), 'utar.edu.my') > 0
+                              OR instr(lower(signon_realm), 'utar.edu.my') > 0
+                          )
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                if found:
+                    return True
+            except (OSError, sqlite3.Error):
+                continue
+    return False
 
 
 def normalize_text(text):
@@ -224,7 +310,7 @@ def diff_course_snapshots(old_snapshot, new_snapshot):
 
 def is_valid_course(title: str) -> bool:
     title = title.strip()
-    if not re.match(r'^[A-Z]{4}\d{4}', title):
+    if not re.search(r'\b[A-Z]{3,5}\s*-?\s*\d{4,5}\b', title):
         return False
         
     # Check against user's blacklisted courses
@@ -256,26 +342,44 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
     大模型高可用轮询系统 (Fallback)
     优先级: 1. Azure GPT-4o (每日免费50次) -> 2. 用户自备 Kimi -> 3. 用户自备 Gemini
     """
-    # 1. Azure OpenAI (GitHub Models 白嫖)
+    # 1. GitHub Models
     try:
         github_key = config_mgr.get("api_keys", {}).get("openai", "")
         if github_key:
-            print("   🤖 [AI 引擎] 尝试主引擎: GitHub Models GPT-4o (User Token)...", flush=True)
-            llm = ChatOpenAI(model="gpt-4o", api_key=github_key, base_url="https://models.inference.ai.azure.com", temperature=0.1)
+            print("   🤖 [AI 引擎] 尝试主引擎: GitHub Models GPT-4.1...", flush=True)
+            llm = ChatOpenAI(
+                model="openai/gpt-4.1",
+                api_key=github_key,
+                base_url="https://models.github.ai/inference",
+                default_headers={
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                temperature=0.1,
+                timeout=45,
+                max_retries=1,
+            )
         else:
             raise ValueError("未配置 GitHub Token，自动回退到下一个可用引擎")
         chain = prompt_template | llm
         res = await chain.ainvoke(kwargs_dict)
         return res.content
     except Exception as e:
-        print(f"      ⚠️ Azure 主引擎已枯竭 (触发限制): {type(e).__name__}", flush=True)
+        print(f"      ⚠️ GitHub Models 调用失败: {type(e).__name__}", flush=True)
 
     # 2. Groq (免费高速引擎)
     try:
         groq_key = config_mgr.get("api_keys", {}).get("groq", "")
         if groq_key:
             print("   🤖 [AI 引擎] 启动备用引擎: Groq (Llama 3)...", flush=True)
-            llm = ChatOpenAI(model="llama-3.3-70b-versatile", api_key=groq_key, base_url="https://api.groq.com/openai/v1", temperature=0.1)
+            llm = ChatOpenAI(
+                model="llama-3.3-70b-versatile",
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=0.1,
+                timeout=45,
+                max_retries=1,
+            )
             chain = prompt_template | llm
             res = await chain.ainvoke(kwargs_dict)
             return res.content
@@ -284,15 +388,18 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
 
     # 3. Gemini (备用引擎，不花钱)
     try:
+        gemini_key = config_mgr.get("api_keys", {}).get("gemini", "")
+        if not gemini_key:
+            raise ValueError("未配置 Gemini API Key")
         print("   🤖 [AI 引擎] 启动备用引擎: Gemini 3.5 Flash...", flush=True)
         from google import genai
-        gemini_key = config_mgr.get("api_keys", {}).get("gemini", "")
         client = genai.Client(api_key=gemini_key)
         
         prompt_text = prompt_template.format(**kwargs_dict)
-        interaction = client.interactions.create(
+        interaction = await asyncio.to_thread(
+            client.interactions.create,
             model="gemini-3.5-flash",
-            input=prompt_text
+            input=prompt_text,
         )
         return interaction.output_text
     except ImportError:
@@ -304,11 +411,15 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
     try:
         print("   🤖 [AI 引擎] 启动最终兜底防线: Kimi (Moonshot)...", flush=True)
         kimi_key = config_mgr.get("api_keys", {}).get("kimi", "")
+        if not kimi_key:
+            raise ValueError("未配置 Kimi API Key")
         llm = ChatOpenAI(
             model="kimi-k2.6", 
             base_url="https://api.moonshot.cn/v1", 
             api_key=kimi_key,
-            temperature=1.0
+            temperature=1.0,
+            timeout=45,
+            max_retries=1,
         )
         chain = prompt_template | llm
         res = await chain.ainvoke(kwargs_dict)
@@ -350,6 +461,32 @@ async def categorize_file_with_ai(filename, link_text):
 async def generate_md_archive(course_name, text_content, course_dir):
     print(f"   📝 正在让大模型提炼【{course_name}】的极致精简笔记...", flush=True)
     try:
+        chunks = chunk_text_by_lines(text_content)
+        if len(chunks) == 1:
+            merged_source = chunks[0]
+        else:
+            extracted_notes = []
+            extraction_prompt = PromptTemplate.from_template(
+                "你是课程信息提取器。请从以下课程内容分块中完整提取事实，"
+                "尤其不要遗漏成绩权重、日期、Deadline、考试、作业、公告和链接。"
+                "只写原文明确存在的内容，不要猜测。\n\n"
+                "【课程】{course_name}\n"
+                "【分块 {chunk_number}/{chunk_count}】\n{web_content}"
+            )
+            for index, chunk in enumerate(chunks, start=1):
+                extracted_notes.append(
+                    await invoke_llm_with_fallback(
+                        extraction_prompt,
+                        {
+                            "course_name": course_name,
+                            "chunk_number": index,
+                            "chunk_count": len(chunks),
+                            "web_content": chunk,
+                        },
+                    )
+                )
+            merged_source = "\n\n--- 分块 ---\n\n".join(extracted_notes)
+
         prompt = PromptTemplate.from_template(
             "你是一个极其干练的大学课业整理专家。下面是课程开学至今的网页原始内容（可能包含提取的链接）。\n"
             "请帮我提炼出最核心的信息，严禁照抄大段原文。必须遵循以下排版：\n"
@@ -361,20 +498,82 @@ async def generate_md_archive(course_name, text_content, course_dir):
             "(把长篇大论的公告压缩成一两句话的要点)\n"
             "### 🔗 重要在线链接\n"
             "(把下方提供的 Teams会议、Google表格等外部链接用 Markdown 语法列出。如果遇到后缀为 '#' 的空链接，请在链接旁备注 '*(⚠️ 链接可能出错或需弹窗，请前往 Moodle 原网页手动处理)*')\n\n"
-            "【原始内容】:\n{web_content}"
+            "以下内容是逐块提取结果。请合并重复项，但不要删除任何明确日期、"
+            "权重、作业或链接。\n\n【逐块提取结果】:\n{web_content}"
         )
-        result_content = await invoke_llm_with_fallback(prompt, {"web_content": text_content[:6000]})
+        result_content = await invoke_llm_with_fallback(
+            prompt,
+            {"web_content": merged_source},
+        )
         
         md_file_path = os.path.join(course_dir, "课程重点归档.md")
-        with open(md_file_path, "w", encoding="utf-8") as f:
-            f.write(f"# {course_name}\n")
-            f.write(f"*归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
-            f.write(result_content)
+        archive_text = (
+            f"# {course_name}\n"
+            f"*归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
+            f"{result_content}"
+        )
+        atomic_write_text(md_file_path, archive_text)
         
         return True  # 成功
     except Exception:
         print(f"   ⚠️ 笔记生成跳过 (所有大模型引擎均失败或无额度)。", flush=True)
         return False  # 失败，需要下次重试
+
+def normalize_ics_calendar(ics_content):
+    match = re.search(
+        r"(BEGIN:VCALENDAR.*?END:VCALENDAR)",
+        ics_content,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    calendar_text = match.group(1).strip().replace("\r\n", "\n")
+    events = re.findall(
+        r"BEGIN:VEVENT.*?END:VEVENT",
+        calendar_text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not events:
+        return None
+
+    normalized_events = []
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for event in events:
+        lines = [line.rstrip() for line in event.splitlines() if line.strip()]
+        start_lines = [
+            line for line in lines if line.upper().startswith("DTSTART")
+        ]
+        if not start_lines:
+            return None
+        for start_line in start_lines:
+            upper_line = start_line.upper()
+            if (
+                "VALUE=DATE" not in upper_line
+                and "TZID=ASIA/KUALA_LUMPUR" not in upper_line
+            ):
+                return None
+
+        if not any(line.upper().startswith("UID:") for line in lines):
+            event_hash = hashlib.sha256(
+                "\n".join(lines).encode("utf-8")
+            ).hexdigest()[:20]
+            lines.insert(-1, f"UID:{event_hash}@wble-agent")
+        if not any(line.upper().startswith("DTSTAMP:") for line in lines):
+            lines.insert(-1, f"DTSTAMP:{timestamp}")
+        normalized_events.append("\n".join(lines))
+
+    header = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//UTAR WBLE Agent//EN",
+        "CALSCALE:GREGORIAN",
+        "X-WR-TIMEZONE:Asia/Kuala_Lumpur",
+    ]
+    return "\r\n".join(
+        header + normalized_events + ["END:VCALENDAR", ""]
+    )
+
 
 async def generate_ics_calendar(course_name, course_dir):
     md_file_path = os.path.join(course_dir, "课程重点归档.md")
@@ -396,30 +595,40 @@ async def generate_ics_calendar(course_name, course_dir):
         "如果没有找到任何符合「包含类型」的明确日期事件，请直接回复：NONE\n\n"
         "如果找到了，请务必直接输出标准 iCalendar (.ics) 格式的内容，不需要任何额外解释。请参照以下模板：\n"
         "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//WBLE Agent//EN\n"
-        "BEGIN:VEVENT\nSUMMARY:Assignment 1\nDTSTART:20260810T150000Z\nDTEND:20260810T160000Z\nEND:VEVENT\n"
+        "BEGIN:VEVENT\nSUMMARY:Assignment 1\n"
+        "DTSTART;TZID=Asia/Kuala_Lumpur:20260810T150000\n"
+        "DTEND;TZID=Asia/Kuala_Lumpur:20260810T160000\nEND:VEVENT\n"
         "END:VCALENDAR\n\n"
-        "注意：如果没有具体结束时间，可以默认结束时间比开始时间晚一小时。如果只有日期没有具体时间，可以默认为当地时间中午12点。必须输出标准的 ics 文本格式。\n\n"
+        "注意：所有带时间的事件必须使用 TZID=Asia/Kuala_Lumpur，"
+        "绝对不要使用结尾为 Z 的 UTC 时间。如果只有日期没有具体时间，"
+        "使用 DTSTART;VALUE=DATE:YYYYMMDD。必须输出标准 ICS。\n\n"
         "【课程重点笔记】:\n{web_content}"
     )
     try:
         ics_content = await invoke_llm_with_fallback(ics_prompt, {"web_content": result_content})
         ics_content = ics_content.strip()
         
-        # 使用正则严格提取日历文本块，无视大模型生成的啰嗦废话
-        match = re.search(r'(BEGIN:VCALENDAR.*?END:VCALENDAR)', ics_content, re.DOTALL | re.IGNORECASE)
         ics_path = os.path.join(course_dir, "Reminder.ics")
-        
-        if match:
-            with open(ics_path, "w", encoding="utf-8") as f:
-                f.write(match.group(1).strip())
-            print("   ✅ 日历文件 Reminder.ics 生成/更新成功！", flush=True)
-        else:
+
+        if re.fullmatch(r"NONE[.!]?", ics_content, re.IGNORECASE):
             print("   ℹ️ 检查完毕，当前无明确日程，不需要日历文件。", flush=True)
             if os.path.exists(ics_path):
                 os.remove(ics_path)
                 print("   🗑️ 已自动清理过期的 Reminder.ics。", flush=True)
-                
-        return True  # 成功调用了 API 无论是否有日程
+            return True
+
+        normalized_calendar = normalize_ics_calendar(ics_content)
+        if normalized_calendar:
+            atomic_write_text(ics_path, normalized_calendar)
+            print("   ✅ 日历文件 Reminder.ics 生成/更新成功！", flush=True)
+            return True
+
+        print(
+            "   ⚠️ AI 返回的日历缺少马来西亚时区或格式无效；"
+            "已保留旧 Reminder.ics，稍后重试。",
+            flush=True,
+        )
+        return False
     except Exception as e:
         print(f"   ⚠️ 日历生成失败，稍后自动重试。({e})", flush=True)
         return False
@@ -461,132 +670,294 @@ def smart_categorize_local(filename, link_text):
     return None
 
 
+class FileTooLargeError(Exception):
+    pass
+
+
+def safe_download_filename(filename, fallback="downloaded_file"):
+    filename = urllib.parse.unquote(str(filename or ""))
+    filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename)
+    filename = filename.rstrip(" .")
+    if not filename or filename in {".", ".."}:
+        filename = fallback
+
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    stem = filename.split(".", 1)[0].upper()
+    if stem in reserved:
+        filename = f"_{filename}"
+    return filename[:240]
+
+
+def filename_from_response(final_url, content_disposition):
+    if content_disposition:
+        message = Message()
+        message["content-disposition"] = content_disposition
+        candidate = message.get_filename()
+        if isinstance(candidate, tuple):
+            candidate = collapse_rfc2231_value(candidate)
+        if candidate:
+            return safe_download_filename(candidate)
+
+    url_name = urllib.parse.urlsplit(final_url).path.rsplit("/", 1)[-1]
+    return safe_download_filename(
+        url_name,
+        fallback=f"downloaded_{int(time.time())}.bin",
+    )
+
+
+def _fetch_url_to_temp(
+    url,
+    temp_dir,
+    max_size_bytes,
+    cookie_header,
+    user_agent,
+    allow_html,
+):
+    headers = {"User-Agent": user_agent}
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    request = urllib.request.Request(url, headers=headers)
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.part")
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            final_url = response.geturl()
+            content_type = response.headers.get_content_type()
+            declared_size = response.headers.get("Content-Length")
+            if declared_size:
+                try:
+                    if int(declared_size) > max_size_bytes:
+                        raise FileTooLargeError(
+                            f"{int(declared_size) / 1024 / 1024:.1f} MB"
+                        )
+                except ValueError:
+                    pass
+
+            if allow_html and content_type in {
+                "text/html", "application/xhtml+xml"
+            }:
+                html_limit = min(max_size_bytes, 5 * 1024 * 1024)
+                body = response.read(html_limit + 1)
+                if len(body) > html_limit:
+                    raise FileTooLargeError("HTML preview exceeds 5 MB")
+                charset = response.headers.get_content_charset() or "utf-8"
+                return {
+                    "kind": "html",
+                    "final_url": final_url,
+                    "text": body.decode(charset, errors="replace"),
+                }
+
+            total_size = 0
+            with open(temp_path, "wb") as temp_file:
+                while True:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > max_size_bytes:
+                        raise FileTooLargeError(
+                            f"download exceeded "
+                            f"{max_size_bytes / 1024 / 1024:.0f} MB"
+                        )
+                    temp_file.write(chunk)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+
+            return {
+                "kind": "file",
+                "final_url": final_url,
+                "filename": filename_from_response(
+                    final_url,
+                    response.headers.get("Content-Disposition", ""),
+                ),
+                "temp_path": temp_path,
+                "size": total_size,
+            }
+    except Exception:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
+
+async def fetch_url_to_temp(page, url, temp_dir, max_size_bytes, allow_html):
+    cookies = await page.context.cookies(url)
+    cookie_header = "; ".join(
+        f"{cookie['name']}={cookie['value']}" for cookie in cookies
+    )
+    try:
+        user_agent = await page.evaluate("() => navigator.userAgent")
+    except Exception:
+        user_agent = "Mozilla/5.0 UTAR-WBLE-Agent"
+    return await asyncio.to_thread(
+        _fetch_url_to_temp,
+        url,
+        temp_dir,
+        max_size_bytes,
+        cookie_header,
+        user_agent,
+        allow_html,
+    )
+
+
+async def place_downloaded_file(result, files_dir, link_text):
+    filename = safe_download_filename(result.get("filename"))
+    temp_path = result["temp_path"]
+    extension = filename.rsplit(".", 1)[-1].lower()
+    if extension in {"mp4", "mkv", "avi", "mov"}:
+        os.remove(temp_path)
+        print(f"        ⚠️ 按策略跳过视频: {filename}", flush=True)
+        return True, 0, True
+
+    category = smart_categorize_local(filename, link_text)
+    if not category:
+        print(
+            f"        🧠 正则匹配失败，召唤 AI 兜底推理 [{filename}]...",
+            flush=True,
+        )
+        category, ai_ok = await categorize_file_with_ai(filename, link_text)
+    else:
+        ai_ok = True
+        print(
+            f"        ⚡ 本地急速分类 [{filename}] -> {category}",
+            flush=True,
+        )
+
+    section_dir = os.path.join(files_dir, category)
+    os.makedirs(section_dir, exist_ok=True)
+    save_path = os.path.abspath(os.path.join(section_dir, filename))
+    section_root = os.path.abspath(section_dir)
+    if os.path.commonpath([section_root, save_path]) != section_root:
+        os.remove(temp_path)
+        raise ValueError(f"Unsafe download filename: {filename}")
+
+    if os.path.exists(save_path):
+        os.remove(temp_path)
+        print(
+            f"        ⏭️ 硬盘上已存在，跳过下载: {category}/{filename}",
+            flush=True,
+        )
+        return True, 0, ai_ok
+
+    os.replace(temp_path, save_path)
+    print(f"        ✅ 下载完成: {category}/{filename}", flush=True)
+    return True, 1, ai_ok
+
+
 async def download_from_current_page(page, course_dir, state_db, course_name):
     files_dir = os.path.join(course_dir, "Files")
     os.makedirs(files_dir, exist_ok=True)
-    
+    temp_dir = os.path.join(files_dir, ".partial")
+    max_size_bytes = max(
+        1, int(config_mgr.get("max_file_size_mb", 50))
+    ) * 1024 * 1024
+
     links_count = await page.locator("a[href*='mod/resource/view.php']").count()
     new_files_count = 0
-    
+
     for i in range(links_count):
         link_el = page.locator("a[href*='mod/resource/view.php']").nth(i)
         href = await link_el.evaluate("node => node.href")
-        
-        # 提取链接的可见文字，提供给 AI 做上下文分析
+        resource_key = canonicalize_url(href)
         link_text = (await link_el.inner_text()).strip().replace("\n", " ")
-        
-        if href and href not in state_db[course_name]["downloaded_files"]:
-            print(f"      ⬇️ [发现目标] 启动底层网络引擎拦截... ({link_text[:30]})", flush=True)
-            
-            try:
-                response = await page.context.request.get(href)
-                content_type = response.headers.get("content-type", "")
-                final_url = response.url
-                
-                if "text/html" in content_type:
-                    html_body = await response.text()
-                    file_urls = re.findall(r'https?://[^"\'<>\s]+file\.php/[^"\'<>\s]+', html_body)
-                    file_urls = list(set(file_urls))
-                    
-                    if not file_urls:
-                        print(f"        ⚠️ 预览页里没找到 file.php 链接，跳过。", flush=True)
-                        state_db[course_name]["downloaded_files"].append(href)
-                        continue
-                    
-                    for file_url in file_urls:
-                        fname = urllib.parse.unquote(file_url.split('/')[-1].split('?')[0])
-                        safe_fn = re.sub(r'[\\/*?:"<>|]', "_", fname)
-                        
-                        ext = safe_fn.split('.')[-1].lower()
-                        if ext in ['mp4', 'mkv', 'avi', 'mov']:
-                            print(f"        ⚠️ 跳过视频: {safe_fn}", flush=True)
-                            continue
-                            
-                        category = smart_categorize_local(safe_fn, link_text)
-                        if not category:
-                            print(f"        🧠 正则匹配失败，召唤 AI 兜底推理 [{safe_fn}]...", flush=True)
-                            category, ai_ok = await categorize_file_with_ai(safe_fn, link_text)
-                            if not ai_ok:
-                                state_db[course_name]["has_unclassified_files"] = True
-                        else:
-                            print(f"        ⚡ 本地急速分类 [{safe_fn}] -> {category}", flush=True)
-                            
-                        section_dir = os.path.join(files_dir, category)
-                        os.makedirs(section_dir, exist_ok=True)
-                        save_path = os.path.join(section_dir, safe_fn)
-                        
-                        if os.path.exists(save_path):
-                            print(f"        ⏭️ 硬盘上已存在该文件，跳过下载: {category}/{safe_fn}", flush=True)
-                            continue
-                        
-                        try:
-                            file_resp = await page.context.request.get(file_url)
-                            body_bytes = await file_resp.body()
-                            max_size_bytes = config_mgr.get("max_file_size_mb", 50) * 1024 * 1024
-                            
-                            if len(body_bytes) > max_size_bytes:
-                                print(f"        ⚠️ 文件过大 ({len(body_bytes)/1024/1024:.1f}MB)，超过设定上限，已跳过下载: {safe_fn}", flush=True)
-                                continue
-                                
-                            with open(save_path, "wb") as f:
-                                f.write(body_bytes)
-                            print(f"        ✅ 下载完成: {category}/{safe_fn}", flush=True)
-                            new_files_count += 1
-                        except Exception as inner_e:
-                            print(f"        ⚠️ 下载失败: {inner_e}", flush=True)
-                    
-                    state_db[course_name]["downloaded_files"].append(href)
-                    continue
-                
-                # 直接返回文件的情况
-                filename = final_url.split('/')[-1].split('?')[0]
-                if not filename or filename == "view.php":
-                    disp = response.headers.get("content-disposition", "")
-                    if "filename=" in disp:
-                        filename = disp.split("filename=")[-1].strip('"')
-                    else:
-                        filename = f"downloaded_{int(time.time())}.pdf"
-                filename = urllib.parse.unquote(filename)
-                safe_filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
-                
-                ext = safe_filename.split('.')[-1].lower()
-                if ext in ['mp4', 'mkv', 'avi', 'mov']:
-                    print(f"      ⚠️ 跳过视频: {safe_filename}", flush=True)
-                else:
-                    category = smart_categorize_local(safe_filename, link_text)
-                    if not category:
-                        print(f"      🧠 正则匹配失败，召唤 AI 兜底推理 [{safe_filename}]...", flush=True)
-                        category, ai_ok = await categorize_file_with_ai(safe_filename, link_text)
-                        if not ai_ok:
-                            state_db[course_name]["has_unclassified_files"] = True
-                    else:
-                        print(f"      ⚡ 本地急速分类 [{safe_filename}] -> {category}", flush=True)
-                        
-                    section_dir = os.path.join(files_dir, category)
-                    os.makedirs(section_dir, exist_ok=True)
-                    
-                    save_path = os.path.join(section_dir, safe_filename)
-                    if os.path.exists(save_path):
-                        print(f"      ⏭️ 硬盘上已存在该文件，跳过下载: {category}/{safe_filename}", flush=True)
-                    else:
-                        body_bytes = await response.body()
-                        max_size_bytes = config_mgr.get("max_file_size_mb", 50) * 1024 * 1024
-                        if len(body_bytes) > max_size_bytes:
-                            print(f"      ⚠️ 文件过大 ({len(body_bytes)/1024/1024:.1f}MB)，超过设定上限，已跳过下载: {safe_filename}", flush=True)
-                        else:
-                            with open(save_path, "wb") as f:
-                                f.write(body_bytes)
-                            print(f"      ✅ 下载完成: {category}/{safe_filename}", flush=True)
-                            new_files_count += 1
-                
-                state_db[course_name]["downloaded_files"].append(href)
-            except Exception as e:
-                print(f"      ⚠️ 下载跳过 (网络错误: {e})", flush=True)
-                state_db[course_name]["downloaded_files"].append(href)
-        elif href:
-            # 已经在 json 里记录过了，直接跳过并打印
-            print(f"      ⏭️  数据库中已有记录，跳过无需下载: {link_text[:40]}", flush=True)
-            
+
+        if not resource_key:
+            continue
+        if resource_key in state_db[course_name]["downloaded_files"]:
+            print(
+                f"      ⏭️ 数据库中已有完成记录: {link_text[:40]}",
+                flush=True,
+            )
+            continue
+
+        print(
+            f"      ⬇️ [发现目标] 流式下载检查... ({link_text[:30]})",
+            flush=True,
+        )
+        resource_complete = True
+        try:
+            result = await fetch_url_to_temp(
+                page, href, temp_dir, max_size_bytes, allow_html=True
+            )
+            if result["kind"] == "file":
+                placed_ok, added, classification_ok = await place_downloaded_file(
+                    result, files_dir, link_text
+                )
+                resource_complete = placed_ok
+                new_files_count += added
+                if not classification_ok:
+                    state_db[course_name]["has_unclassified_files"] = True
+            else:
+                soup = BeautifulSoup(result["text"], "html.parser")
+                file_urls = {
+                    urllib.parse.urljoin(result["final_url"], link.get("href"))
+                    for link in soup.select("a[href]")
+                    if "file.php/" in (link.get("href") or "")
+                }
+                if not file_urls:
+                    print(
+                        "        ⚠️ 预览页未找到 file.php 文件，保留待重试。",
+                        flush=True,
+                    )
+                    resource_complete = False
+
+                for file_url in sorted(file_urls):
+                    try:
+                        file_result = await fetch_url_to_temp(
+                            page,
+                            file_url,
+                            temp_dir,
+                            max_size_bytes,
+                            allow_html=False,
+                        )
+                        placed_ok, added, classification_ok = (
+                            await place_downloaded_file(
+                            file_result, files_dir, link_text
+                            )
+                        )
+                        resource_complete = resource_complete and placed_ok
+                        new_files_count += added
+                        if not classification_ok:
+                            state_db[course_name][
+                                "has_unclassified_files"
+                            ] = True
+                    except FileTooLargeError as error:
+                        resource_complete = False
+                        print(
+                            f"        ⚠️ 文件超过限制 ({error})，"
+                            "本资源将在以后继续检查。",
+                            flush=True,
+                        )
+                    except Exception as error:
+                        resource_complete = False
+                        print(f"        ⚠️ 文件下载失败: {error}", flush=True)
+        except FileTooLargeError as error:
+            resource_complete = False
+            print(
+                f"        ⚠️ 文件超过限制 ({error})，"
+                "提高限制后会自动重试。",
+                flush=True,
+            )
+        except Exception as error:
+            resource_complete = False
+            print(
+                f"      ⚠️ 下载失败，保留待重试: {error}",
+                flush=True,
+            )
+
+        if resource_complete:
+            state_db[course_name]["downloaded_files"].append(resource_key)
+
+    if os.path.isdir(temp_dir) and not os.listdir(temp_dir):
+        os.rmdir(temp_dir)
     return new_files_count
 
 def _normalize_link_list(items):
@@ -628,14 +999,17 @@ async def extract_course_snapshot(page, course_name):
                 "resource", "label", "forum", "assignment", "assign",
                 "folder", "page", "quiz", "url"
             ];
-            const rows = Array.from(
-                root.querySelectorAll(
+            const rows = Array.from(new Set(
+                Array.from(root.querySelectorAll(
                     "table.weeks tr.section[id^='section-'], "
-                    + "table.topics tr.section[id^='section-']"
-                )
-            );
+                    + "table.topics tr.section[id^='section-'], "
+                    + "ul.weeks li.section[id^='section-'], "
+                    + "ul.topics li.section[id^='section-'], "
+                    + "li.section.main[id^='section-']"
+                ))
+            ));
             const sections = rows.map(row => {
-                const content = row.querySelector("td.content");
+                const content = row.querySelector("td.content, .content");
                 const activities = content
                     ? Array.from(
                         content.querySelectorAll(
@@ -663,7 +1037,9 @@ async def extract_course_snapshot(page, course_name):
                 return {
                     id: row.id,
                     title: cleanText(
-                        row.querySelector(".weekdates, .sectionname")
+                        row.querySelector(
+                            ".weekdates, .sectionname, h3.sectionname"
+                        )
                     ),
                     summary: cleanText(
                         content ? content.querySelector(".summary") : null
@@ -687,7 +1063,7 @@ async def extract_course_snapshot(page, course_name):
                 ok: rows.length > 0,
                 reason: rows.length > 0
                     ? ""
-                    : "missing table.weeks/table.topics section rows",
+                    : "missing weeks/topics section rows",
                 sections,
                 external_links: externalLinks
             };
@@ -727,7 +1103,7 @@ async def extract_course_snapshot(page, course_name):
     activity_count = sum(
         len(section.get("activities", [])) for section in sections
     )
-    if not sections or activity_count == 0:
+    if not sections:
         return None, (
             f"implausible course structure: sections={len(sections)}, "
             f"activities={activity_count}"
@@ -824,11 +1200,20 @@ class WBLEScanner:
         self.playwright = None
         self.context = None
         self.page = None
+        self.has_saved_wble_credentials = False
         
     async def init_browser(self, is_background=False):
         print(f"🤖 初始化浏览器引擎 (后台模式={is_background})...", flush=True)
-        self.playwright = await async_playwright().start()
         user_data_dir = os.path.join(os.getcwd(), "chrome_data")
+        self.has_saved_wble_credentials = has_saved_wble_credentials(
+            user_data_dir
+        )
+        if self.has_saved_wble_credentials:
+            print(
+                "🔐 当前 Chrome profile 已保存 WBLE 登录凭据。",
+                flush=True
+            )
+        self.playwright = await async_playwright().start()
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -836,15 +1221,26 @@ class WBLEScanner:
                 channel="chrome",
                 ignore_https_errors=True
             )
-        except Exception as e:
-            print(f"⚠️ 未找到系统 Chrome 浏览器，正在自动为你下载便携版引擎... (请耐心等待)", flush=True)
-            import subprocess
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=is_background,
-                ignore_https_errors=True
+        except Exception as chrome_error:
+            print(
+                "⚠️ 系统 Chrome 启动失败，尝试已安装的 Playwright Chromium。",
+                flush=True,
             )
+            try:
+                self.context = (
+                    await self.playwright.chromium.launch_persistent_context(
+                        user_data_dir,
+                        headless=is_background,
+                        ignore_https_errors=True,
+                    )
+                )
+            except Exception as chromium_error:
+                await self.playwright.stop()
+                self.playwright = None
+                raise RuntimeError(
+                    "无法启动浏览器。请安装或更新 Google Chrome，并确认没有"
+                    "另一个 WBLE Agent 正在占用 chrome_data。"
+                ) from chromium_error
 
         if is_background and os.path.exists(AUTH_STATE_FILE):
             try:
@@ -858,19 +1254,126 @@ class WBLEScanner:
                 print(f"⚠️ 无法载入已保存的登录状态: {e}", flush=True)
 
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        
+
+    async def wait_for_password_save_confirmation(self, page):
+        """
+        Pause after an interactive login so Chrome's password prompt is not
+        interrupted by the scanner immediately navigating away.
+        """
+        overlay_id = "wble-agent-login-confirmation"
+        try:
+            await page.evaluate(
+                '''overlayId => {
+                    document.getElementById(overlayId)?.remove();
+
+                    const overlay = document.createElement("div");
+                    overlay.id = overlayId;
+                    overlay.style.cssText = [
+                        "position:fixed",
+                        "inset:0",
+                        "z-index:2147483647",
+                        "display:flex",
+                        "align-items:center",
+                        "justify-content:center",
+                        "background:rgba(15,23,42,.46)",
+                        "font-family:'Segoe UI',Arial,sans-serif"
+                    ].join(";");
+
+                    const panel = document.createElement("div");
+                    panel.style.cssText = [
+                        "width:min(460px,calc(100vw - 40px))",
+                        "padding:28px",
+                        "border-radius:20px",
+                        "background:#fff",
+                        "box-shadow:0 24px 70px rgba(15,23,42,.28)",
+                        "color:#172033",
+                        "text-align:center"
+                    ].join(";");
+
+                    const title = document.createElement("div");
+                    title.textContent = "登录成功";
+                    title.style.cssText =
+                        "font-size:24px;font-weight:700;margin-bottom:12px";
+
+                    const message = document.createElement("div");
+                    message.textContent =
+                        "请先处理 Chrome 右上角的“保存密码”提示。完成后点击下方按钮，WBLE Agent 才会开始扫描。";
+                    message.style.cssText =
+                        "font-size:15px;line-height:1.65;color:#526078;margin-bottom:22px";
+
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.textContent = "我已处理，开始扫描";
+                    button.style.cssText = [
+                        "border:0",
+                        "border-radius:12px",
+                        "padding:12px 24px",
+                        "background:#16a34a",
+                        "color:#fff",
+                        "font-size:15px",
+                        "font-weight:700",
+                        "cursor:pointer"
+                    ].join(";");
+                    button.addEventListener("click", () => overlay.remove());
+
+                    panel.append(title, message, button);
+                    overlay.append(panel);
+                    document.body.append(overlay);
+                }''',
+                overlay_id
+            )
+            print(
+                "🔑 登录成功。扫描已暂停，请先处理 Chrome 的保存密码提示，"
+                "再点击网页中的“我已处理，开始扫描”。",
+                flush=True
+            )
+            await page.wait_for_function(
+                "overlayId => !document.getElementById(overlayId)",
+                arg=overlay_id,
+                timeout=120000
+            )
+            print("▶️ 用户已确认，继续执行扫描。", flush=True)
+        except Exception as error:
+            print(
+                f"⚠️ 登录确认提示未完成 ({type(error).__name__})，"
+                "等待结束后继续扫描。",
+                flush=True
+            )
+            try:
+                await page.locator(f"#{overlay_id}").evaluate(
+                    "element => element.remove()"
+                )
+            except Exception:
+                pass
+
     async def wait_for_login(self, is_background=False):
+        manual_login_page_seen = False
         if is_background:
             # 后台没有用户可以选择校区，因此必须直接进入上次登录成功后
             # 保存下来的校区主页，不能从 WBLE 公共入口开始。
             login_check_url = config_mgr.get("dashboard_url", TARGET_URL)
             print(f"👻 正在后台验证已保存的 WBLE 会话: {login_check_url}", flush=True)
         else:
-            login_check_url = TARGET_URL
+            # Once a campus has been selected, go there directly. This lets the
+            # persistent Chrome profile reuse its cookies and saved credentials.
+            login_check_url = config_mgr.get("dashboard_url", "") or TARGET_URL
             print("\n" + "❗"*25, flush=True)
             print("🛑 登录状态检查：", flush=True)
-            print("👉 请在浏览器里选择校区并完成登录，登录成功后脚本会自动开始工作！", flush=True)
-            print("👉 ⚠️ 温馨提示：选择校区后会弹出新标签页，属于正常现象，请在新标签页完成登录！", flush=True)
+            if login_check_url == TARGET_URL:
+                print("👉 请在浏览器里选择校区并完成登录。", flush=True)
+                print(
+                    "👉 ⚠️ 选择校区后弹出新标签页属于正常现象。",
+                    flush=True
+                )
+            else:
+                print(
+                    f"👉 正在直接打开上次使用的校区: {login_check_url}",
+                    flush=True
+                )
+            print(
+                "👉 如出现登录页，请完成登录；程序会等待你处理保存密码提示。",
+                flush=True
+            )
             print("❗"*25 + "\n", flush=True)
 
         await self.page.goto(login_check_url, wait_until="domcontentloaded")
@@ -884,6 +1387,8 @@ class WBLEScanner:
             all_pages = self.context.pages
             for p in all_pages:
                 current_url = p.url
+                if not is_background and "login" in current_url.lower():
+                    manual_login_page_seen = True
                 if ("wble" in current_url and ".utar.edu.my" in current_url 
                         and "login" not in current_url 
                         and current_url.rstrip("/") != "https://wble.utar.edu.my"):
@@ -896,6 +1401,22 @@ class WBLEScanner:
                             await self.context.storage_state(path=AUTH_STATE_FILE)
                             print("🔐 登录状态已安全保存，供下次后台巡逻使用。", flush=True)
                             self.page = p  # 切换主控页面到登录成功的那个标签页
+                            if (
+                                not is_background
+                                and manual_login_page_seen
+                                and not self.has_saved_wble_credentials
+                            ):
+                                await self.wait_for_password_save_confirmation(p)
+                            elif (
+                                not is_background
+                                and manual_login_page_seen
+                                and self.has_saved_wble_credentials
+                            ):
+                                print(
+                                    "🔐 已检测到保存过的 WBLE 密码，"
+                                    "跳过保存密码提醒。",
+                                    flush=True
+                                )
                             return True
                     except Exception:
                         pass
@@ -941,6 +1462,15 @@ class WBLEScanner:
                 course_state.setdefault("md_generated", False)
                 course_state.setdefault("ics_generated", False)
                 course_state.setdefault("has_unclassified_files", False)
+                if course_state.get("download_tracking_version") != 2:
+                    if course_state["downloaded_files"]:
+                        print(
+                            "   🔄 下载状态规则升级：重新核验历史资源；"
+                            "硬盘已有文件不会重复写入。",
+                            flush=True,
+                        )
+                    course_state["downloaded_files"] = []
+                    course_state["download_tracking_version"] = 2
 
                 old_snapshot = course_state.get("content_snapshot")
                 if not isinstance(old_snapshot, dict):
@@ -1093,6 +1623,11 @@ class WBLEScanner:
 
             except Exception as e:
                 print(f"   ❌ 访问或处理课程失败: {e}", flush=True)
+            finally:
+                # Persist after each course so a later crash cannot discard the
+                # completed downloads and snapshots from earlier courses.
+                config_mgr.state = state_db
+                config_mgr.save_state()
         
         config_mgr.state = state_db
         config_mgr.save_state()
@@ -1106,7 +1641,7 @@ class WBLEScanner:
                 if item['files_count'] > 0:
                     desp += f"> 📦 **自动深潜为您抓取了 {item['files_count']} 份新文件，已存入电脑！**\n"
                 desp += "\n---\n"
-            send_wechat_notification(title, desp)
+            await send_wechat_notification(title, desp)
         
         print(f"✅ 本轮深潜任务完成。", flush=True)
         return updates_found

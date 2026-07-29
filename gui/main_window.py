@@ -2,17 +2,21 @@ import sys
 import os
 import re
 import asyncio
+import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QLineEdit, QTextEdit, QFileDialog, QCheckBox, 
     QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem, QSlider, QComboBox,
-    QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton, QAbstractItemView
+    QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton,
+    QAbstractItemView, QApplication
 )
 from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath, QMovie
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QSize, QPoint
 
 from core.config import config_mgr
 from core.engine import WBLEScanner
+from core.autostart import is_autostart_enabled, set_autostart_enabled
+from core.filesystem import move_to_recycle_bin
 
 
 def resource_path(filename):
@@ -29,7 +33,10 @@ class LogStream(QObject):
     textWritten = pyqtSignal(str)
 
     def write(self, text):
-        self.textWritten.emit(str(text))
+        text = str(text)
+        self.textWritten.emit(text)
+        if text.strip():
+            logging.getLogger("wble.console").info(text.rstrip())
         
     def flush(self):
         pass
@@ -128,7 +135,7 @@ class ScanSuccessAnimation(QWidget):
         layout.addWidget(self.label)
 
         self.movie = QMovie(animation_path)
-        self.movie.setCacheMode(QMovie.CacheMode.CacheAll)
+        self.movie.setCacheMode(QMovie.CacheMode.CacheNone)
         self.label.setMovie(self.movie)
 
         self.hide_timer = QTimer(self)
@@ -167,12 +174,14 @@ class ScanSuccessAnimation(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("UTAR WBLE Agent - macOS Edition")
+        self.setWindowTitle("UTAR WBLE Agent")
         self.resize(1000, 650)
-        self.setWindowIcon(QIcon("utar_logo.png"))
+        self.setWindowIcon(QIcon(resource_path("utar_logo.png")))
         
         self.scanner = WBLEScanner()
         self.scan_task = None
+        self.is_quitting = False
+        self.close_notice_shown = False
         
         self.init_ui()
         self.init_tray()
@@ -186,6 +195,7 @@ class MainWindow(QMainWindow):
         self.log_stream = LogStream()
         self.log_stream.textWritten.connect(self.append_log)
         sys.stdout = self.log_stream
+        sys.stderr = self.log_stream
         
         print("🚀 [System] WBLE Agent initialized. Ready to start!")
         
@@ -283,7 +293,7 @@ class MainWindow(QMainWindow):
         svg_path_right = os.path.join(tempfile.gettempdir(), "right_sidebar_icon.svg")
         with open(svg_path_right, "w", encoding="utf-8") as f:
             f.write(right_sidebar_svg)
-            
+
         self.btn_toggle_right.setIcon(QIcon(svg_path_right))
         self.btn_toggle_right.setIconSize(QSize(20, 20))
         self.btn_toggle_right.setToolTip("Toggle Settings")
@@ -299,6 +309,7 @@ class MainWindow(QMainWindow):
         
         self.console = QTextEdit()
         self.console.setReadOnly(True)
+        self.console.document().setMaximumBlockCount(3000)
         # Clean white terminal with soft gray text
         self.console.setStyleSheet("background-color: #f5f5f7; color: #515154; font-family: 'SF Pro Text', 'Segoe UI', Consolas; font-size: 13px; border-radius: 12px; padding: 10px; border: 1px solid #e5e5ea;")
         center_panel.addWidget(self.console, stretch=1)
@@ -365,7 +376,7 @@ class MainWindow(QMainWindow):
         lbl_api_section.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f; margin-top: 15px;")
         right_panel.addWidget(lbl_api_section)
         
-        lbl_github = QLabel("GitHub GPT-4o Token (Free)")
+        lbl_github = QLabel("GitHub Models Token (Free)")
         lbl_github.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 5px; font-weight: bold;")
         right_panel.addWidget(lbl_github)
         github_layout = QHBoxLayout()
@@ -373,7 +384,7 @@ class MainWindow(QMainWindow):
         self.in_openai = QLineEdit(config_mgr.get("api_keys", {}).get("openai", ""))
         self.in_openai.setEchoMode(QLineEdit.EchoMode.Password)
         btn_get_github = QPushButton("Get Key")
-        btn_get_github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/marketplace/models/azure-openai/gpt-4o")))
+        btn_get_github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/marketplace/models")))
         btn_help_github = self.create_help_btn(
             "GitHub 获取教程与规则", 
             "教程: 点击 [Get Key] 登录 -> 右上角点击 [Use this model] -> 选择 [Get a Personal Access Token] -> 滑到最底点击 [Generate token]。\n\n"
@@ -496,7 +507,7 @@ class MainWindow(QMainWindow):
         # Auto Start
         self.chk_autostart = QCheckBox("Silent Startup (System Tray)")
         self.chk_autostart.setStyleSheet("color: #1d1d1f; font-size: 13px; margin-top: 15px;")
-        self.chk_autostart.setChecked(config_mgr.get("auto_start", False))
+        self.chk_autostart.setChecked(is_autostart_enabled())
         right_panel.addWidget(self.chk_autostart)
         
         # Save Button
@@ -542,7 +553,7 @@ class MainWindow(QMainWindow):
             self.left_panel_widget.setMinimumWidth(0)
             self.anim.setStartValue(self.left_panel_widget.width())
             self.anim.setEndValue(0)
-            
+
         self.anim.start()
 
     def toggle_right_sidebar(self):
@@ -591,17 +602,17 @@ class MainWindow(QMainWindow):
 
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon("utar_logo.png"))
+        self.tray_icon.setIcon(QIcon(resource_path("utar_logo.png")))
         
         tray_menu = QMenu()
         show_action = QAction("打开主面板", self)
-        show_action.triggered.connect(self.showNormal)
+        show_action.triggered.connect(self.show_and_activate)
         
         scan_action = QAction("立即强制扫描", self)
         scan_action.triggered.connect(self.force_scan)
         
         quit_action = QAction("完全退出", self)
-        quit_action.triggered.connect(sys.exit)
+        quit_action.triggered.connect(self.request_quit)
         
         tray_menu.addAction(show_action)
         tray_menu.addAction(scan_action)
@@ -610,6 +621,51 @@ class MainWindow(QMainWindow):
         
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.show()
+
+    def show_and_activate(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        if self.is_quitting:
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        if not self.close_notice_shown:
+            self.tray_icon.showMessage(
+                "WBLE Agent 仍在运行",
+                "程序已隐藏到系统托盘；使用托盘菜单可完全退出。",
+                QSystemTrayIcon.MessageIcon.Information,
+                5000,
+            )
+            self.close_notice_shown = True
+
+    def request_quit(self):
+        if self.is_quitting:
+            return
+        self.is_quitting = True
+        self.scan_timer.stop()
+        asyncio.create_task(self.shutdown_and_quit())
+
+    async def shutdown_and_quit(self):
+        if self.scan_task and not self.scan_task.done():
+            self.scan_task.cancel()
+            try:
+                await self.scan_task
+            except asyncio.CancelledError:
+                pass
+        else:
+            try:
+                await self.scanner.cleanup()
+            except Exception as error:
+                print(f"⚠️ 退出时浏览器清理失败: {error}")
+
+        self.tray_icon.hide()
+        app = QApplication.instance()
+        if app:
+            app.quit()
         
     def refresh_course_list(self):
         self.course_list.clear()
@@ -686,32 +742,66 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+            # 将本地文件夹移入回收站，避免误删后无法恢复。
+            safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
+            base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
+            base_dir = os.path.abspath(base_dir)
+            course_dir = os.path.abspath(
+                os.path.join(base_dir, safe_course_name)
+            )
+
+            if (
+                course_dir == base_dir
+                or os.path.commonpath([base_dir, course_dir]) != base_dir
+            ):
+                QMessageBox.critical(
+                    self,
+                    "删除已阻止",
+                    "课程文件夹路径校验失败，为保护数据已取消删除。",
+                )
+                return
+
+            collisions = [
+                other
+                for other in config_mgr.get("available_courses", [])
+                if other != course
+                and re.sub(r'[\\/*?:"<>|]', "_", other) == safe_course_name
+            ]
+            if collisions:
+                QMessageBox.critical(
+                    self,
+                    "删除已阻止",
+                    "存在名称映射到同一文件夹的其他课程，"
+                    "为避免误删已取消操作。",
+                )
+                return
+
+            if os.path.exists(course_dir):
+                try:
+                    move_to_recycle_bin(course_dir)
+                    print(f"🗑️ 已将课程文件夹移入回收站: {course_dir}")
+                except Exception as e:
+                    print(f"⚠️ 删除文件夹失败 {course_dir}: {e}")
+                    QMessageBox.warning(
+                        self,
+                        "删除失败",
+                        f"课程文件夹未能移入回收站：\n{e}",
+                    )
+                    return
+
             blacklist = config_mgr.get("blacklisted_courses", [])
             if course not in blacklist:
                 blacklist.append(course)
                 config_mgr.set("blacklisted_courses", blacklist)
-                
-            # 清理 state_db
+
             state_db = config_mgr.state
             if course in state_db:
                 del state_db[course]
                 config_mgr.state = state_db
-                
-            # 清除本地文件夹
-            import shutil
-            safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
-            base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
-            course_dir = os.path.join(base_dir, safe_course_name)
-            
-            if os.path.exists(course_dir):
-                try:
-                    shutil.rmtree(course_dir)
-                    print(f"🗑️ 已成功删除本地文件夹: {course_dir}")
-                except Exception as e:
-                    print(f"⚠️ 删除文件夹失败 {course_dir}: {e}")
+            config_mgr.save_state()
                     
             self.refresh_course_list()
-            print(f"✅ 已将课程移出监控列表并清理所有本地数据: {course}")
+            print(f"✅ 已将课程移出监控列表: {course}")
 
     def open_course_folder(self, item):
         course = item.data(Qt.ItemDataRole.UserRole) or item.text()
@@ -739,7 +829,7 @@ class MainWindow(QMainWindow):
         if not (openai_key or groq_key or kimi_key or gemini_key):
             QMessageBox.warning(self, "缺少 API 密钥", "【必填】请在右侧至少填写一个 AI 引擎的 API 密钥 (GitHub / Groq / Kimi / Gemini)！\n否则软件无法为你自动总结课件。")
             return False
-            
+
         if openai_key and not (openai_key.startswith("github_pat_") or openai_key.startswith("ghp_")):
             QMessageBox.warning(self, "格式错误", "GitHub Token 格式似乎不对！\n正常应该以 github_pat_ 或 ghp_ 开头，请参考旁边的 'i' 教程重新获取。")
             return False
@@ -756,25 +846,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "格式错误", "Gemini API Key 格式似乎不对！\n正常应该以 AIza 或 AQ 开头，请参考教程重新获取。")
             return False
 
-        config_mgr.set("download_dir", self.in_path.text())
-        keys = config_mgr.get("api_keys", {})
+        keys = dict(config_mgr.get("api_keys", {}))
         keys["openai"] = openai_key
         keys["groq"] = groq_key
         keys["kimi"] = kimi_key
         keys["gemini"] = gemini_key
-        config_mgr.set("api_keys", keys)
-        
-        config_mgr.set("serverchan_key", self.in_wechat.text().strip())
         
         try:
             limit = int(self.in_file_limit.text().strip())
-            config_mgr.set("max_file_size_mb", limit)
+            if limit <= 0:
+                raise ValueError
         except ValueError:
-            pass
-            
-        config_mgr.set("scan_interval_str", self.cb_interval.currentText())
-        config_mgr.set("auto_start", self.chk_autostart.isChecked())
-        config_mgr.set("setup_completed", True)
+            QMessageBox.warning(
+                self,
+                "文件大小设置无效",
+                "Max File Limit 必须是大于 0 的整数。",
+            )
+            return False
+
+        auto_start_enabled = self.chk_autostart.isChecked()
+        try:
+            set_autostart_enabled(auto_start_enabled)
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "开机自启动设置失败",
+                f"Windows 启动项更新失败：\n{error}"
+            )
+            self.chk_autostart.setChecked(is_autostart_enabled())
+            return False
+
+        config_mgr.update({
+            "download_dir": self.in_path.text(),
+            "api_keys": keys,
+            "serverchan_key": self.in_wechat.text().strip(),
+            "max_file_size_mb": limit,
+            "scan_interval_str": self.cb_interval.currentText(),
+            "auto_start": auto_start_enabled,
+            "setup_completed": True,
+        })
         self.preferences_saved_this_session = True
         print("💾 配置已成功保存！")
         self.update_timer_interval()
@@ -801,7 +911,12 @@ class MainWindow(QMainWindow):
             msg_box.setWindowTitle("Confirm Download Path")
             msg_box.setText(f"Your files will be downloaded to:\n\n{current_path}\n\nIs this correct?")
             from PyQt6.QtGui import QPixmap
-            pixmap = QPixmap("utar_logo.png").scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pixmap = QPixmap(resource_path("utar_logo.png")).scaled(
+                64,
+                64,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
             msg_box.setIconPixmap(pixmap)
             msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
@@ -883,7 +998,8 @@ class MainWindow(QMainWindow):
                 print(f"⚠️ 浏览器引擎清理失败: {cleanup_error}")
             finally:
                 # 无论成功、失败或登录过期，均从本轮结束时重新完整倒计时。
-                self.update_timer_interval()
+                if not self.is_quitting:
+                    self.update_timer_interval()
 
     def apply_macos_dark_theme(self):
         # Premium Minimalist White Light Mode (macOS Big Sur+ inspired)
