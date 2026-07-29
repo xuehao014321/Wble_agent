@@ -38,6 +38,8 @@ wble_state.json
 wble_state.json.bak
 WBLE_Downloads/
 config.json
+wble_config.json
+wble_state.json
 *.log
 *.log.*
 *.tmp

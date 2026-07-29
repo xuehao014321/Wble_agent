@@ -340,12 +340,17 @@ async def extract_course_links(page):
 async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
     """
     大模型高可用轮询系统 (Fallback)
-    优先级: 1. Azure GPT-4o (每日免费50次) -> 2. 用户自备 Kimi -> 3. 用户自备 Gemini
+    优先级: 1. Azure GPT-4o -> 2. Groq -> 3. Gemini -> 4. Kimi
     """
     # 1. GitHub Models
     try:
         github_key = config_mgr.get("api_keys", {}).get("openai", "")
         if github_key:
+            print("   🤖 [AI 引擎] 尝试主引擎: GitHub Models GPT-4o (User Token)...", flush=True)
+            llm = ChatOpenAI(model="gpt-4o", api_key=github_key, base_url="https://models.inference.ai.azure.com", temperature=0.1)
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
             print("   🤖 [AI 引擎] 尝试主引擎: GitHub Models GPT-4.1...", flush=True)
             llm = ChatOpenAI(
                 model="openai/gpt-4.1",
@@ -361,9 +366,6 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
             )
         else:
             raise ValueError("未配置 GitHub Token，自动回退到下一个可用引擎")
-        chain = prompt_template | llm
-        res = await chain.ainvoke(kwargs_dict)
-        return res.content
     except Exception as e:
         print(f"      ⚠️ GitHub Models 调用失败: {type(e).__name__}", flush=True)
 
@@ -383,12 +385,23 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
             chain = prompt_template | llm
             res = await chain.ainvoke(kwargs_dict)
             return res.content
+        else:
+            raise ValueError("未配置 Groq Token")
     except Exception as e:
         print(f"      ⚠️ Groq 引擎调用失败: {type(e).__name__}", flush=True)
 
     # 3. Gemini (备用引擎，不花钱)
     try:
         gemini_key = config_mgr.get("api_keys", {}).get("gemini", "")
+        if gemini_key:
+            print("   🤖 [AI 引擎] 启动备用引擎: Gemini 2.0 Flash...", flush=True)
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=gemini_key, temperature=0.1)
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
+        else:
+            raise ValueError("未配置 Gemini Token")
         if not gemini_key:
             raise ValueError("未配置 Gemini API Key")
         print("   🤖 [AI 引擎] 启动备用引擎: Gemini 3.5 Flash...", flush=True)
@@ -403,14 +416,26 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
         )
         return interaction.output_text
     except ImportError:
-        print("      ⚠️ 未安装最新版 google-genai，无法调用 Gemini。", flush=True)
+        print("      ⚠️ 未安装 langchain-google-genai，无法调用 Gemini。", flush=True)
     except Exception as e:
         print(f"      ⚠️ Gemini 备用引擎调用失败: {type(e).__name__} - {e}", flush=True)
 
-    # 3. Kimi (最终兜底防线，需扣费)
+    # 4. Kimi (最终兜底防线，需扣费)
     try:
-        print("   🤖 [AI 引擎] 启动最终兜底防线: Kimi (Moonshot)...", flush=True)
         kimi_key = config_mgr.get("api_keys", {}).get("kimi", "")
+        if kimi_key:
+            print("   🤖 [AI 引擎] 启动最终兜底防线: Kimi (Moonshot)...", flush=True)
+            llm = ChatOpenAI(
+                model="moonshot-v1-8k", 
+                base_url="https://api.moonshot.cn/v1", 
+                api_key=kimi_key,
+                temperature=1.0
+            )
+            chain = prompt_template | llm
+            res = await chain.ainvoke(kwargs_dict)
+            return res.content
+        else:
+            raise ValueError("未配置 Kimi Token")
         if not kimi_key:
             raise ValueError("未配置 Kimi API Key")
         llm = ChatOpenAI(
@@ -427,7 +452,7 @@ async def invoke_llm_with_fallback(prompt_template, kwargs_dict):
     except Exception as e:
         print(f"      ⚠️ Kimi 调用失败: {type(e).__name__}", flush=True)
         
-    raise Exception("所有大模型引擎均已阵亡，请补充额度。")
+    raise Exception("所有大模型引擎均已阵亡或未配置，请补充额度或设置 API Key。")
 
 
 async def categorize_file_with_ai(filename, link_text):
