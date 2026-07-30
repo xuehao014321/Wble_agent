@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "available_courses": [],
     "last_scan_report": {},
     "password_prompt_handled": False,
+    "onboarding_completed": False,
     "blacklisted_courses": [],
     "blacklisted_course_keys": [],
     "theme": "dark"

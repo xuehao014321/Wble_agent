@@ -24,18 +24,25 @@ The application is designed for Windows 10/11 and runs from the system tray.
   - **Background Scan:** launches a headless browser and scans silently without
     stealing keyboard focus.
 - **Scheduled patrols:** choose 30 minutes, 1 hour, 4 hours, or 12 hours.
+- **First-run guidance:** a short introduction explains the application, then
+  an interactive spotlight walks through the AI key, download location,
+  optional WeChat notifications, interval, Silent Startup, Save Preferences,
+  Force Scan, and the monitored-course sidebar. The **用户导览** button can
+  replay it at any time.
 - **Multiple faculties/campuses:** repeat Force Scan once for each WBLE entry.
-  Every registered target is then scanned sequentially during one scheduled
-  patrol. A failure in one target does not stop the others.
+  Each entry receives an isolated authorization state. Scheduled and startup
+  patrols scan up to two entries concurrently; a failure or expired login in
+  one target does not stop the others.
   - **eWBLE-KPR:** FAS, FEd, THP, and FBF
     (`https://ewble-kpr.utar.edu.my/login/index.php`)
   - **WBLE-KPR:** FEGT, FICT, FSc, and FCS
     (`https://wble-kpr.utar.edu.my/wble-kpr/login/index.php`)
 - **Startup scan:** when Silent Startup is enabled, Windows starts the agent in
   the tray and immediately performs one background scan.
-- **Login-session reuse:** WBLE cookies and the dedicated Chrome profile are
-  retained between runs. A background scan stops quickly and asks for a Force
-  Scan if login has expired.
+- **Per-target login-session reuse:** each registered WBLE entry keeps its own
+  cookies/local storage. Logging into a second faculty cannot overwrite the
+  first faculty's background authorization. If one session expires, only that
+  entry asks for another Force Scan.
 - **Stable course change detection:** reads the structured
   `#middle-column` course area and ignores dynamic sidebar content such as
   recent activity, timestamps, and online users.
@@ -70,14 +77,16 @@ The application is designed for Windows 10/11 and runs from the system tray.
    protected background browser. WBLE Agent records only that the reminder
    was handled; it never reads Chrome's password database.
 8. If your courses are split across another faculty/campus, click Force Scan
-   again and choose the other entry. It will be added instead of replacing the
-   first one.
-9. Scheduled background patrols now scan every registered entry.
+   again and log into the other entry. It receives a separate background
+   authorization instead of replacing the first one.
+9. Repeat this once for every required faculty/campus. Scheduled background
+   patrols then scan up to two registered entries concurrently.
 
 If a notification says the background browser requires login, open the main
-window and perform one Force Scan. The application does not need to click the
-page every 30 seconds; it keeps the browser profile and starts a fresh,
-authenticated browser for each scheduled scan.
+window and perform one Force Scan for the entry marked `🔐`. Other authorized
+entries continue scanning. The application does not need to click the page
+every 30 seconds; it loads each entry's isolated state into a fresh background
+browser context.
 
 Registered targets are shown in Settings:
 
@@ -86,14 +95,18 @@ Registered targets are shown in Settings:
 - `🔐` — login is required for this target
 - `⚠️` — the latest scan failed for another reason
 
-Removing a target only stops future monitoring for that entry. Existing
-downloaded files and historical course state are retained.
+Removing a target stops future monitoring and removes only that entry's saved
+authorization. Existing downloaded files and historical course state are
+retained.
 
 ## Configuration
 
 The following AI providers are supported:
 
-- **GitHub Models:** a GitHub PAT with model-read permission.
+- **GitHub Models:** a Personal Access Token (classic) beginning with `ghp_`.
+  Create it from **Settings → Developer settings → Personal access tokens →
+  Tokens (classic)** and grant only the minimum access needed. The application
+  intentionally rejects fine-grained `github_pat_` tokens.
 - **Groq:** an API key beginning with `gsk_`.
 - **Google Gemini:** an AI Studio API key.
 - **Kimi / Moonshot:** an API key beginning with `sk-`.
