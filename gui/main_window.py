@@ -18,6 +18,7 @@ from core.engine import (
     TARGETS_VERSION,
     WBLEScanner,
     get_dashboard_targets,
+    remove_target_auth_state,
 )
 from core.autostart import is_autostart_enabled, set_autostart_enabled
 from core.filesystem import move_to_recycle_bin
@@ -797,6 +798,7 @@ class MainWindow(QMainWindow):
             "dashboard_url": targets[-1]["url"] if targets else "",
             "available_courses": available,
         })
+        remove_target_auth_state(target)
         self.refresh_dashboard_targets()
         self.refresh_course_list()
         print(f"✅ 已停止巡逻目标: {target['label']}")

@@ -28,9 +28,10 @@ if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 TARGET_URL = "https://wble.utar.edu.my/"
-AUTH_STATE_FILE = os.path.join(os.getcwd(), "wble_auth_state.json")
+AUTH_STATES_DIRNAME = "wble_auth_states"
+MAX_CONCURRENT_TARGETS = 2
 SNAPSHOT_VERSION = 2
-TARGETS_VERSION = 2
+TARGETS_VERSION = 3
 WBLE_PORTALS = {
     "ewble-kpr.utar.edu.my": {
         "login_url": "https://ewble-kpr.utar.edu.my/login/index.php",
@@ -377,19 +378,17 @@ def normalize_dashboard_targets(raw_targets=None, legacy_url=""):
 
 def get_dashboard_targets():
     """Load targets and persist a one-time migration from dashboard_url."""
-    migrated = config_mgr.get("dashboard_targets_version", 0) >= TARGETS_VERSION
+    stored_version = config_mgr.get("dashboard_targets_version", 0)
+    migrated = stored_version >= TARGETS_VERSION
     raw_targets = config_mgr.get("dashboard_targets", [])
-    if not migrated:
-        raw_targets = (
-            list(raw_targets) if isinstance(raw_targets, list) else []
-        )
-        raw_targets.extend(
-            {"url": portal["dashboard_url"]}
-            for portal in WBLE_PORTALS.values()
-        )
+    legacy_url = (
+        config_mgr.get("dashboard_url", "")
+        if stored_version == 0
+        else ""
+    )
     targets = normalize_dashboard_targets(
         raw_targets,
-        "" if migrated else config_mgr.get("dashboard_url", ""),
+        "" if migrated else legacy_url,
     )
     if (
         targets != config_mgr.get("dashboard_targets", [])
@@ -442,6 +441,54 @@ def register_dashboard_target(url, page_title=""):
         "dashboard_url": url,
     })
     return target
+
+
+def target_auth_state_path(target):
+    """Return a traversal-safe per-target browser-state path."""
+    target_id = dashboard_target_id(target.get("url", ""))
+    return os.path.join(
+        os.getcwd(),
+        AUTH_STATES_DIRNAME,
+        f"{target_id}.json",
+    )
+
+
+def load_target_auth_state(target):
+    """Load one target's isolated cookies/local storage, if valid."""
+    path = target_auth_state_path(target)
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            state = json.load(file)
+        if (
+            isinstance(state, dict)
+            and isinstance(state.get("cookies"), list)
+            and state["cookies"]
+        ):
+            return state
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+async def save_target_auth_state(context, target):
+    """Atomically refresh one target's isolated browser state."""
+    state = await context.storage_state()
+    auth_dir = os.path.dirname(target_auth_state_path(target))
+    os.makedirs(auth_dir, exist_ok=True)
+    atomic_write_text(
+        target_auth_state_path(target),
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def remove_target_auth_state(target):
+    """Remove only the selected target's saved authorization."""
+    path = target_auth_state_path(target)
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def course_state_key(course_url):
@@ -1605,13 +1652,41 @@ async def analyze_course_updates(course_name, diff_text, new_text):
 class WBLEScanner:
     def __init__(self):
         self.playwright = None
+        self.browser = None
         self.context = None
         self.page = None
+        self.browser_closed_event = None
         self.password_prompt_handled = False
         self.last_scan_report = {}
         
     async def init_browser(self, is_background=False):
         print(f"🤖 初始化浏览器引擎 (后台模式={is_background})...", flush=True)
+        self.playwright = await async_playwright().start()
+
+        if is_background:
+            launch_options = {"headless": True}
+            try:
+                self.browser = await self.playwright.chromium.launch(
+                    channel="chrome",
+                    **launch_options,
+                )
+            except Exception:
+                print(
+                    "⚠️ 系统 Chrome 后台启动失败，尝试 Playwright Chromium。",
+                    flush=True,
+                )
+                try:
+                    self.browser = await self.playwright.chromium.launch(
+                        **launch_options,
+                    )
+                except Exception as chromium_error:
+                    await self.playwright.stop()
+                    self.playwright = None
+                    raise RuntimeError(
+                        "无法启动后台浏览器。请安装或更新 Google Chrome。"
+                    ) from chromium_error
+            return
+
         user_data_dir = os.path.join(os.getcwd(), "chrome_data")
         profile_exists = os.path.isfile(
             os.path.join(user_data_dir, "Default", "Preferences")
@@ -1641,7 +1716,6 @@ class WBLEScanner:
             launch_options["ignore_default_args"] = [
                 "--enable-automation"
             ]
-        self.playwright = await async_playwright().start()
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -1668,18 +1742,13 @@ class WBLEScanner:
                     "另一个 WBLE Agent 正在占用 chrome_data。"
                 ) from chromium_error
 
-        if is_background and os.path.exists(AUTH_STATE_FILE):
-            try:
-                with open(AUTH_STATE_FILE, "r", encoding="utf-8") as auth_file:
-                    auth_state = json.load(auth_file)
-                cookies = auth_state.get("cookies", [])
-                if cookies:
-                    await self.context.add_cookies(cookies)
-                    print(f"🔐 已载入 {len(cookies)} 个已保存的登录 Cookie。", flush=True)
-            except Exception as e:
-                print(f"⚠️ 无法载入已保存的登录状态: {e}", flush=True)
-
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        browser_closed_event = asyncio.Event()
+        self.browser_closed_event = browser_closed_event
+        self.context.on(
+            "close",
+            lambda *_: browser_closed_event.set(),
+        )
 
     async def wait_for_password_save_confirmation(self, page):
         """
@@ -1774,9 +1843,19 @@ class WBLEScanner:
             print("▶️ 用户已确认，继续执行扫描。", flush=True)
             return True
         except Exception as error:
+            browser_was_closed = (
+                self.browser_closed_event is not None
+                and self.browser_closed_event.is_set()
+            )
             print(
-                f"⚠️ 登录确认提示未完成 ({type(error).__name__})，"
-                "本轮扫描已停止，不会跳过保存密码步骤。",
+                (
+                    "⚠️ 浏览器已被用户关闭，本次登录失败。"
+                    if browser_was_closed
+                    else (
+                        f"⚠️ 登录确认提示未完成 ({type(error).__name__})，"
+                        "本轮扫描已停止，不会跳过保存密码步骤。"
+                    )
+                ),
                 flush=True
             )
             try:
@@ -1827,12 +1906,7 @@ class WBLEScanner:
             return False
 
     async def find_background_login(self):
-        """
-        Find any usable registered target.
-
-        Failure of one target must not prevent the scan cycle from trying the
-        remaining targets independently.
-        """
+        """Confirm that at least one target has an isolated authorization."""
         targets = get_dashboard_targets()
         if not targets:
             print(
@@ -1841,63 +1915,47 @@ class WBLEScanner:
             )
             return False
 
-        probe_failures = []
+        authorized_targets = []
+        missing_targets = []
         for target in targets:
-            print(
-                f"👻 后台验证科系/校区: {target['label']}",
-                flush=True,
-            )
-            try:
-                await self.page.goto(
-                    target["url"], wait_until="domcontentloaded"
+            if load_target_auth_state(target):
+                authorized_targets.append(target)
+                print(
+                    f"🔐 已找到独立授权: {target['label']}",
+                    flush=True,
                 )
-                for _ in range(5):
-                    if await self.is_authenticated_wble_page(self.page):
-                        print(
-                            f"✅ 已找到可用登录会话: {target['label']}",
-                            flush=True,
-                        )
-                        return True
-                    await asyncio.sleep(1)
-                probe_failures.append({
+            else:
+                missing_targets.append({
                     **target,
                     "reason": "login_required",
                 })
-            except Exception as error:
-                probe_failures.append({
-                    **target,
-                    "reason": type(error).__name__,
-                })
                 print(
-                    f"⚠️ {target['label']} 登录验证失败: "
-                    f"{type(error).__name__}",
+                    f"🔐 {target['label']} 尚未独立授权，需要 Force Scan。",
                     flush=True,
                 )
 
+        if authorized_targets:
+            print(
+                f"✅ {len(authorized_targets)}/{len(targets)} 个目标已有"
+                "独立后台授权；未授权目标不会阻塞其他目标。",
+                flush=True,
+            )
+            return True
+
         checked_at = datetime.now(timezone.utc).isoformat()
-        failure_by_id = {
-            failure["id"]: failure for failure in probe_failures
-        }
         updated_targets = []
         for target in targets:
-            failure = failure_by_id.get(target["id"], {})
-            reason = failure.get("reason", "login_required")
-            updated_target = {
+            updated_targets.append({
                 **target,
                 "last_checked_at": checked_at,
-                "last_status": (
-                    "login_required"
-                    if reason == "login_required"
-                    else "error"
-                ),
-                "last_error": reason,
-            }
-            updated_targets.append(updated_target)
+                "last_status": "login_required",
+                "last_error": "login_required",
+            })
         report = {
             "finished_at": checked_at,
             "targets_total": len(targets),
             "targets_ok": 0,
-            "targets_failed": probe_failures,
+            "targets_failed": missing_targets,
             "courses_seen": 0,
             "updates_found": 0,
         }
@@ -1908,7 +1966,7 @@ class WBLEScanner:
         })
         self.last_scan_report = report
         print(
-            "⚠️ 所有已登记科系/校区都需要重新登录。",
+            "⚠️ 所有已登记科系/校区都需要分别 Force Scan 一次。",
             flush=True,
         )
         return False
@@ -1953,6 +2011,16 @@ class WBLEScanner:
         max_retries = 15 if is_background else 600
 
         for _ in range(max_retries):
+            if (
+                self.browser_closed_event is not None
+                and self.browser_closed_event.is_set()
+            ):
+                print(
+                    "⚠️ 检测到用户已关闭浏览器，本次登录失败。",
+                    flush=True,
+                )
+                return False
+
             # 关键修复：监控 context 里所有标签页，而不只是初始页
             all_pages = self.context.pages
             for p in all_pages:
@@ -1985,9 +2053,11 @@ class WBLEScanner:
                             target = register_dashboard_target(
                                 current_url, page_title
                             )
-                            await self.context.storage_state(path=AUTH_STATE_FILE)
+                            await save_target_auth_state(
+                                self.context, target
+                            )
                             print(
-                                f"🔐 已登记扫描目标: {target['label']} "
+                                f"🔐 已独立保存授权并登记目标: {target['label']} "
                                 f"(共 {len(get_dashboard_targets())} 个)",
                                 flush=True,
                             )
@@ -2004,7 +2074,19 @@ class WBLEScanner:
                             return True
                     except Exception:
                         pass
-            await asyncio.sleep(1)
+            try:
+                await asyncio.wait_for(
+                    self.browser_closed_event.wait(),
+                    timeout=1,
+                )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                print(
+                    "⚠️ 检测到用户已关闭浏览器，本次登录失败。",
+                    flush=True,
+                )
+                return False
 
         if is_background:
             final_urls = ", ".join(p.url for p in self.context.pages)
@@ -2015,17 +2097,20 @@ class WBLEScanner:
         return False
 
         
-    async def scan_dashboard_target(self, target, state_db):
+    async def scan_dashboard_target(self, target, state_db, page=None):
         """Scan one target; orchestration keeps failures isolated per target."""
+        page = page or self.page
+        if page is None:
+            raise RuntimeError("Target scan page is unavailable")
         print(f"\n🏫 正在巡逻科系/校区: {target['label']}", flush=True)
-        await self.page.goto(
+        await page.goto(
             target["url"], wait_until="domcontentloaded"
         )
-        await self.page.wait_for_timeout(2000)
-        if not await self.is_authenticated_wble_page(self.page):
+        await page.wait_for_timeout(2000)
+        if not await self.is_authenticated_wble_page(page):
             raise DashboardLoginRequired(target)
         
-        courses = await extract_course_links(self.page)
+        courses = await extract_course_links(page)
         course_records = []
         updates_found = []
         for name, link in courses.items():
@@ -2096,7 +2181,7 @@ class WBLEScanner:
 
                 new_files, text_content, new_snapshot, extraction_ok = (
                     await deep_scan_course(
-                        self.page,
+                        page,
                         link,
                         course_dir,
                         state_db,
@@ -2286,13 +2371,42 @@ class WBLEScanner:
         print(f"✅ 本轮深潜任务完成。", flush=True)
         return updates_found, course_records
 
+    async def scan_target_in_isolated_context(self, target, state_db):
+        """Scan one target with only that target's saved browser state."""
+        # Tests and direct helper use can supply their own page implementation.
+        if self.browser is None:
+            return await self.scan_dashboard_target(target, state_db)
+
+        auth_state = load_target_auth_state(target)
+        if not auth_state:
+            raise DashboardLoginRequired(target)
+
+        context = await self.browser.new_context(
+            storage_state=auth_state,
+            ignore_https_errors=True,
+        )
+        page = await context.new_page()
+        try:
+            result = await self.scan_dashboard_target(
+                target, state_db, page=page
+            )
+            await save_target_auth_state(context, target)
+            print(
+                f"🔄 已刷新独立登录状态: {target['label']}",
+                flush=True,
+            )
+            return result
+        finally:
+            await context.close()
+
     async def run_scan_cycle(self):
-        """Scan every registered target and isolate failures per faculty."""
+        """Scan targets with isolated auth and at most two concurrent tasks."""
         state_db = config_mgr.state
         targets = get_dashboard_targets()
         print(
             f"\n[{datetime.now().strftime('%H:%M:%S')}] 🚀 "
-            f"开始多科系巡逻，共 {len(targets)} 个目标。",
+            f"开始多科系并发巡逻，共 {len(targets)} 个目标，"
+            f"并发上限 {MAX_CONCURRENT_TARGETS}。",
             flush=True,
         )
         updates_found = []
@@ -2300,33 +2414,58 @@ class WBLEScanner:
         successful_targets = []
         failed_targets = []
 
-        for target in targets:
-            try:
-                target_updates, target_courses = (
-                    await self.scan_dashboard_target(target, state_db)
-                )
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_TARGETS)
+
+        async def scan_one(target):
+            async with semaphore:
+                try:
+                    target_updates, target_courses = (
+                        await self.scan_target_in_isolated_context(
+                            target, state_db
+                        )
+                    )
+                    return {
+                        "target": target,
+                        "updates": target_updates,
+                        "courses": target_courses,
+                    }
+                except DashboardLoginRequired:
+                    print(
+                        f"⚠️ {target['label']} 需要登录，"
+                        "不影响其他目标。",
+                        flush=True,
+                    )
+                    return {
+                        "target": target,
+                        "reason": "login_required",
+                    }
+                except Exception as error:
+                    print(
+                        f"⚠️ {target['label']} 扫描失败 "
+                        f"({type(error).__name__})，不影响其他目标。",
+                        flush=True,
+                    )
+                    return {
+                        "target": target,
+                        "reason": type(error).__name__,
+                    }
+
+        results = await asyncio.gather(*(
+            scan_one(target) for target in targets
+        ))
+        for result in results:
+            target = result["target"]
+            if "reason" not in result:
+                target_updates = result["updates"]
+                target_courses = result["courses"]
                 updates_found.extend(target_updates)
                 available_courses.extend(target_courses)
                 successful_targets.append(target)
-            except DashboardLoginRequired:
+            else:
                 failed_targets.append({
                     **target,
-                    "reason": "login_required",
+                    "reason": result["reason"],
                 })
-                print(
-                    f"⚠️ {target['label']} 需要登录，继续扫描其他目标。",
-                    flush=True,
-                )
-            except Exception as error:
-                failed_targets.append({
-                    **target,
-                    "reason": type(error).__name__,
-                })
-                print(
-                    f"⚠️ {target['label']} 扫描失败 "
-                    f"({type(error).__name__})，继续扫描其他目标。",
-                    flush=True,
-                )
 
         # Replace records for successful targets. Retain the last known course
         # list for targets that were temporarily unavailable.
@@ -2406,14 +2545,21 @@ class WBLEScanner:
 
     async def cleanup(self):
         context = self.context
+        browser = self.browser
         playwright = self.playwright
         self.context = None
+        self.browser = None
         self.playwright = None
         self.page = None
+        self.browser_closed_event = None
 
         try:
             if context:
                 await context.close()
         finally:
-            if playwright:
-                await playwright.stop()
+            try:
+                if browser:
+                    await browser.close()
+            finally:
+                if playwright:
+                    await playwright.stop()

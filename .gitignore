@@ -31,6 +31,7 @@ venv.bak/
 .idea/
 *.spec
 chrome_data/
+wble_auth_states/
 wble_auth_state.json
 wble_config.json
 wble_config.json.bak
