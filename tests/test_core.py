@@ -15,9 +15,17 @@ from core.engine import (
     safe_download_filename,
 )
 from core.security import protect_secret, unprotect_secret
+from gui.main_window import is_github_classic_token
 
 
 class CoreBehaviorTests(unittest.TestCase):
+    def test_only_github_classic_tokens_are_accepted(self):
+        self.assertTrue(is_github_classic_token("ghp_example"))
+        self.assertTrue(is_github_classic_token("  ghp_example  "))
+        self.assertFalse(is_github_classic_token("github_pat_example"))
+        self.assertFalse(is_github_classic_token("gho_example"))
+        self.assertFalse(is_github_classic_token(""))
+
     def test_chrome_password_manager_preferences_are_enabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             preferences_path = os.path.join(

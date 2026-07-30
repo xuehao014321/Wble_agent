@@ -10,8 +10,14 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton,
     QAbstractItemView, QApplication, QScrollArea, QFrame
 )
-from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath, QMovie
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QSize, QPoint
+from PyQt6.QtGui import (
+    QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter,
+    QPainterPath, QMovie, QPen
+)
+from PyQt6.QtCore import (
+    Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve,
+    QTimer, QSize, QPoint, QRect
+)
 
 from core.config import config_mgr
 from core.engine import (
@@ -32,6 +38,11 @@ def resource_path(filename):
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
     return os.path.join(base_dir, filename)
+
+
+def is_github_classic_token(value):
+    """Accept only GitHub personal access tokens (classic)."""
+    return str(value or "").strip().startswith("ghp_")
 
 
 class LogStream(QObject):
@@ -176,6 +187,243 @@ class ScanSuccessAnimation(QWidget):
         self.hide()
 
 
+class SpotlightGuide(QWidget):
+    """Modal coach marks that spotlight one main-window control at a time."""
+
+    def __init__(self, parent, steps):
+        super().__init__(parent)
+        self.steps = steps
+        self.step_index = 0
+        self.highlight_rect = QRect()
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self.card = QFrame(self)
+        self.card.setObjectName("spotlightGuideCard")
+        self.card.setStyleSheet("""
+            QFrame#spotlightGuideCard {
+                background: white;
+                border: 1px solid rgba(255, 255, 255, 0.75);
+                border-radius: 18px;
+            }
+            QLabel#spotlightGuideTitle {
+                color: #172033;
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#spotlightGuideBody {
+                color: #526078;
+                font-size: 14px;
+                line-height: 1.5;
+            }
+            QLabel#spotlightGuideCounter {
+                color: #8a94a6;
+                font-size: 12px;
+            }
+            QPushButton {
+                min-height: 34px;
+                padding: 0 14px;
+                border-radius: 9px;
+            }
+            QPushButton#spotlightGuideNext {
+                background: #007aff;
+                color: white;
+                border: none;
+                font-weight: 600;
+            }
+        """)
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(22, 20, 22, 18)
+        card_layout.setSpacing(10)
+
+        self.counter_label = QLabel()
+        self.counter_label.setObjectName("spotlightGuideCounter")
+        self.title_label = QLabel()
+        self.title_label.setObjectName("spotlightGuideTitle")
+        self.body_label = QLabel()
+        self.body_label.setObjectName("spotlightGuideBody")
+        self.body_label.setWordWrap(True)
+
+        card_layout.addWidget(self.counter_label)
+        card_layout.addWidget(self.title_label)
+        card_layout.addWidget(self.body_label)
+
+        controls = QHBoxLayout()
+        self.skip_button = QPushButton("跳过导览")
+        self.back_button = QPushButton("上一步")
+        self.next_button = QPushButton("下一步")
+        self.next_button.setObjectName("spotlightGuideNext")
+        self.skip_button.clicked.connect(self.finish)
+        self.back_button.clicked.connect(self.previous_step)
+        self.next_button.clicked.connect(self.next_step)
+        controls.addWidget(self.skip_button)
+        controls.addStretch()
+        controls.addWidget(self.back_button)
+        controls.addWidget(self.next_button)
+        card_layout.addLayout(controls)
+
+        self.card.setFixedWidth(390)
+        self.hide()
+
+    def start(self):
+        self.step_index = 0
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+        self.setFocus()
+        self.show_step()
+
+    def show_step(self):
+        step = self.steps[self.step_index]
+        target = step["target"]
+        parent = self.parentWidget()
+
+        if (
+            parent.right_panel_widget.isAncestorOf(target)
+            and parent.right_panel_widget.maximumWidth() == 0
+        ):
+            parent.right_panel_widget.setMinimumWidth(250)
+            parent.right_panel_widget.setMaximumWidth(400)
+        if (
+            (
+                target is parent.left_panel_widget
+                or parent.left_panel_widget.isAncestorOf(target)
+            )
+            and parent.left_panel_widget.maximumWidth() == 0
+        ):
+            parent.left_panel_widget.setMinimumWidth(150)
+            parent.left_panel_widget.setMaximumWidth(350)
+
+        if parent.right_panel_widget.isAncestorOf(target):
+            parent.right_panel_widget.ensureWidgetVisible(
+                target, 24, 80
+            )
+
+        self.counter_label.setText(
+            f"新用户操作指南  ·  {self.step_index + 1}/{len(self.steps)}"
+        )
+        self.title_label.setText(step["title"])
+        self.body_label.setText(step["body"])
+        self.back_button.setVisible(self.step_index > 0)
+        self.next_button.setText(
+            "完成" if self.step_index == len(self.steps) - 1 else "下一步"
+        )
+        self.card.adjustSize()
+        self.card.setFixedWidth(390)
+        QTimer.singleShot(60, self.refresh_geometry)
+
+    def refresh_geometry(self):
+        if not self.isVisible():
+            return
+        self.setGeometry(self.parentWidget().rect())
+        target = self.steps[self.step_index]["target"]
+        # The target can live inside QScrollArea while this overlay is a
+        # sibling on the main window. Mapping directly between siblings gives
+        # incorrect coordinates on Windows/high-DPI displays, especially
+        # after the settings panel scrolls. Global coordinates provide a
+        # stable bridge between the two widget hierarchies.
+        top_left = self.mapFromGlobal(
+            target.mapToGlobal(QPoint(0, 0))
+        )
+        self.highlight_rect = QRect(
+            top_left, target.size()
+        ).adjusted(-9, -9, 9, 9)
+
+        margin = 20
+        card_width = self.card.width()
+        card_height = self.card.sizeHint().height()
+        if self.highlight_rect.center().x() > self.width() // 2:
+            card_x = self.highlight_rect.left() - card_width - margin
+        else:
+            card_x = self.highlight_rect.right() + margin
+        card_x = max(margin, min(card_x, self.width() - card_width - margin))
+        card_y = self.highlight_rect.center().y() - card_height // 2
+        card_y = max(margin, min(card_y, self.height() - card_height - margin))
+        self.card.setGeometry(card_x, card_y, card_width, card_height)
+        self.card.raise_()
+        self.update()
+
+    def next_step(self):
+        if self.step_index >= len(self.steps) - 1:
+            self.finish()
+            return
+        self.step_index += 1
+        self.show_step()
+
+    def previous_step(self):
+        if self.step_index == 0:
+            return
+        self.step_index -= 1
+        self.show_step()
+
+    def finish(self):
+        config_mgr.set("onboarding_completed", True)
+        self.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.refresh_geometry)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.finish()
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.next_step()
+        elif event.key() == Qt.Key.Key_Left:
+            self.previous_step()
+        elif event.key() == Qt.Key.Key_Right:
+            self.next_step()
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        hole = self.highlight_rect.intersected(self.rect())
+        shade = QColor(11, 18, 32, 185)
+        if not hole.isValid():
+            painter.fillRect(self.rect(), shade)
+            return
+
+        # Paint four independent panels around the spotlight instead of
+        # subtracting a QPainterPath. Path subtraction is unreliable for
+        # translucent child widgets on some Windows/high-DPI combinations.
+        painter.fillRect(
+            QRect(0, 0, self.width(), max(0, hole.top())),
+            shade,
+        )
+        painter.fillRect(
+            QRect(
+                0,
+                hole.bottom() + 1,
+                self.width(),
+                max(0, self.height() - hole.bottom() - 1),
+            ),
+            shade,
+        )
+        painter.fillRect(
+            QRect(
+                0,
+                hole.top(),
+                max(0, hole.left()),
+                max(0, hole.height()),
+            ),
+            shade,
+        )
+        painter.fillRect(
+            QRect(
+                hole.right() + 1,
+                hole.top(),
+                max(0, self.width() - hole.right() - 1),
+                max(0, hole.height()),
+            ),
+            shade,
+        )
+
+        painter.setPen(QPen(QColor("#007aff"), 3))
+        painter.drawRoundedRect(hole, 14, 14)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -187,6 +435,8 @@ class MainWindow(QMainWindow):
         self.scan_task = None
         self.is_quitting = False
         self.close_notice_shown = False
+        self.onboarding_checked = False
+        self.spotlight_guide = None
         
         self.init_ui()
         self.init_tray()
@@ -304,10 +554,32 @@ class MainWindow(QMainWindow):
         self.btn_toggle_right.setToolTip("Toggle Settings")
         self.btn_toggle_right.setStyleSheet("QToolButton { border: none; padding: 4px; border-radius: 6px; } QToolButton:hover { background-color: #e5e5ea; }")
         self.btn_toggle_right.clicked.connect(self.toggle_right_sidebar)
+
+        self.btn_user_guide = QPushButton("用户导览")
+        self.btn_user_guide.setObjectName("userGuideButton")
+        self.btn_user_guide.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_user_guide.setToolTip("重新查看 WBLE Agent 新用户操作指南")
+        self.btn_user_guide.setStyleSheet("""
+            QPushButton#userGuideButton {
+                background: #eef6ff;
+                color: #0066cc;
+                border: 1px solid #cfe5ff;
+                border-radius: 9px;
+                padding: 5px 12px;
+                font-weight: 600;
+            }
+            QPushButton#userGuideButton:hover {
+                background: #dfeeff;
+            }
+        """)
+        self.btn_user_guide.clicked.connect(
+            lambda: self.start_user_guide(show_intro=True)
+        )
         
         center_top_layout.addWidget(self.btn_toggle_sidebar)
         center_top_layout.addWidget(lbl_console)
         center_top_layout.addStretch()
+        center_top_layout.addWidget(self.btn_user_guide)
         center_top_layout.addWidget(self.btn_toggle_right)
         
         center_panel.addLayout(center_top_layout)
@@ -362,59 +634,62 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(title_vlayout)
         header_layout.addStretch()
         
-        btn_overview = self.create_help_btn(
-            "WBLE Agent 总览指南",
-            "欢迎使用 WBLE Agent (极简特供版)！🚀\n\n"
-            "这是你的全自动化课件管家，核心功能如下：\n\n"
-            "1. 📥 无感同步: 自动登录 WBLE 并在后台深潜抓取所有最新的课件、实验指导和考试资料，分门别类存入你指定的文件夹。\n"
-            "2. 🧠 AI 智能总结: 每次网页有新动态（比如老师发了新公告、布置了作业），自动调用大模型为你生成精简的 Markdown 笔记。\n"
-            "3. 📱 微信实时推送: 如果有重要更新，它会通过 Server酱 瞬间推送到你的手机微信。\n"
-            "4. 🛡️ 智能防爆: 自动识别和过滤（可通过 Max File Limit 拦截）过大的无用文件或教学录像。\n\n"
-            "💡 最佳实践: \n"
-            "配好左侧的任何一个大模型 API 密钥并勾选 [Silent Startup] (开机自启)。它就会像一个幽灵管家，默默潜伏在系统托盘，保你这学期课件一字不落！"
-        )
-        btn_overview.setFixedSize(30, 30) # Make the main overview button slightly larger
-        header_layout.addWidget(btn_overview)
-        
         right_panel.addLayout(header_layout)
         
         # Download Path
         lbl_path = QLabel("Download Location")
         lbl_path.setStyleSheet("color: #86868b; font-size: 12px;")
         right_panel.addWidget(lbl_path)
-        path_layout = QHBoxLayout()
+        self.download_path_row = QWidget()
+        path_layout = QHBoxLayout(self.download_path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
         self.in_path = QLineEdit(config_mgr.get("download_dir"))
         self.in_path.setReadOnly(True)
         self.btn_browse = QPushButton("Browse")
         self.btn_browse.clicked.connect(self.browse_path)
         path_layout.addWidget(self.in_path)
         path_layout.addWidget(self.btn_browse)
-        right_panel.addLayout(path_layout)
+        right_panel.addWidget(self.download_path_row)
         
         # API Keys Section
-        lbl_api_section = QLabel("AI Engines (必填: 下列至少选一)")
-        lbl_api_section.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f; margin-top: 15px;")
-        right_panel.addWidget(lbl_api_section)
+        self.lbl_api_section = QLabel("AI Engines (必填: 下列至少选一)")
+        self.lbl_api_section.setStyleSheet("font-size: 14px; font-weight: 600; color: #1d1d1f; margin-top: 15px;")
+        right_panel.addWidget(self.lbl_api_section)
         
-        lbl_github = QLabel("GitHub Models Token (Free)")
+        lbl_github = QLabel("GitHub Models Classic Token (Free)")
         lbl_github.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 5px; font-weight: bold;")
         right_panel.addWidget(lbl_github)
-        github_layout = QHBoxLayout()
+        self.github_key_row = QWidget()
+        github_layout = QHBoxLayout(self.github_key_row)
+        github_layout.setContentsMargins(0, 0, 0, 0)
         github_layout.setSpacing(6)
         self.in_openai = QLineEdit(config_mgr.get("api_keys", {}).get("openai", ""))
         self.in_openai.setEchoMode(QLineEdit.EchoMode.Password)
+        self.in_openai.setPlaceholderText("ghp_...")
         btn_get_github = QPushButton("Get Key")
-        btn_get_github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/marketplace/models")))
+        btn_get_github.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl("https://github.com/settings/tokens/new")
+            )
+        )
         btn_help_github = self.create_help_btn(
-            "GitHub 获取教程与规则", 
-            "教程: 点击 [Get Key] 登录 -> 右上角点击 [Use this model] -> 选择 [Get a Personal Access Token] -> 滑到最底点击 [Generate token]。\n\n"
-            "💡 免费规则: GitHub 官方提供免费的 GPT-4o 额度，通常为每分钟 15 次调用，每天最多 150 次。系统每天会自动刷新额度，绝对足够日常的课件总结使用，纯白嫖无负担！\n\n"
-            "🔑 最后，复制生成的以 github_pat_ 或 ghp_ 开头的密钥粘贴于此。"
+            "GitHub Classic Token 获取教程",
+            "1. 点击 [Get Key] 并登录 GitHub。\n"
+            "2. 确认进入 Settings → Developer settings → "
+            "Personal access tokens → Tokens (classic)。\n"
+            "3. 点击 [Generate new token (classic)]，填写名称并设置"
+            "合理的有效期。\n"
+            "4. 仅用于 GitHub Models 时保持最小权限，不要勾选 repo、"
+            "admin 等无关的高风险权限。\n"
+            "5. 点击 [Generate token]，立即复制生成的 Token。\n\n"
+            "🔑 本程序只接受以 ghp_ 开头的 Personal Access Token "
+            "(classic)，不接受 github_pat_ 开头的 Fine-grained Token。\n\n"
+            "⚠️ Token 与密码同等重要，请勿截图、转发或提交到 GitHub。"
         )
         github_layout.addWidget(self.in_openai)
         github_layout.addWidget(btn_get_github)
         github_layout.addWidget(btn_help_github)
-        right_panel.addLayout(github_layout)
+        right_panel.addWidget(self.github_key_row)
         
         lbl_groq = QLabel("Groq API Key (Fast & Free)")
         lbl_groq.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 10px; font-weight: bold;")
@@ -480,7 +755,9 @@ class MainWindow(QMainWindow):
         lbl_wechat = QLabel("Server酱 WeChat Push Key (Optional)")
         lbl_wechat.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 10px; font-weight: bold;")
         right_panel.addWidget(lbl_wechat)
-        wechat_layout = QHBoxLayout()
+        self.wechat_key_row = QWidget()
+        wechat_layout = QHBoxLayout(self.wechat_key_row)
+        wechat_layout.setContentsMargins(0, 0, 0, 0)
         wechat_layout.setSpacing(6)
         self.in_wechat = QLineEdit(config_mgr.get("serverchan_key", ""))
         self.in_wechat.setEchoMode(QLineEdit.EchoMode.Password)
@@ -495,7 +772,7 @@ class MainWindow(QMainWindow):
         wechat_layout.addWidget(self.in_wechat)
         wechat_layout.addWidget(btn_get_wechat)
         wechat_layout.addWidget(btn_help_wechat)
-        right_panel.addLayout(wechat_layout)
+        right_panel.addWidget(self.wechat_key_row)
         
         # Interval
         lbl_interval = QLabel("Scan Frequency")
@@ -603,6 +880,152 @@ class MainWindow(QMainWindow):
             resource_path("scan_success.webp"),
             self
         )
+        self.spotlight_guide = SpotlightGuide(
+            self,
+            [
+                {
+                    "target": self.github_key_row,
+                    "title": "1. 填写一个 AI Key",
+                    "body": (
+                        "至少填写 GitHub、Groq、Kimi 或 Gemini 中的一个。"
+                        "推荐先使用免费的 GitHub Classic Token；点击右侧 "
+                        "Get Key 和 i 可查看获取方法。"
+                    ),
+                },
+                {
+                    "target": self.download_path_row,
+                    "title": "2. 选择课件保存位置",
+                    "body": (
+                        "点击 Browse 选择文件夹。扫描到的课件和 AI 生成的 "
+                        "Markdown 更新摘要都会整理到这里。"
+                    ),
+                },
+                {
+                    "target": self.wechat_key_row,
+                    "title": "3. 设置微信更新提醒（可选）",
+                    "body": (
+                        "填写 Server酱 SendKey 后，发现课程更新时可以收到"
+                        "微信提醒。不填写也不影响后台扫描、课件下载和 AI 摘要。"
+                        "点击右侧 Get Key 和 i 可查看获取方法。"
+                    ),
+                },
+                {
+                    "target": self.cb_interval,
+                    "title": "4. 设置后台巡逻频率",
+                    "body": (
+                        "选择程序多久静默检查一次 WBLE。首次使用建议保留 "
+                        "30 minutes。"
+                    ),
+                },
+                {
+                    "target": self.chk_autostart,
+                    "title": "5. 设置开机自动巡逻",
+                    "body": (
+                        "勾选 Silent Startup 后，Windows 开机时会在系统托盘"
+                        "静默启动 WBLE Agent，并立即进行一次后台扫描；之后"
+                        "继续按照你选择的频率巡逻。"
+                    ),
+                },
+                {
+                    "target": self.btn_save,
+                    "title": "6. 保存设置",
+                    "body": (
+                        "填写完成后一定要点击 Save Preferences。API Key 会使用 "
+                        "Windows 当前账户加密后保存在本机。"
+                    ),
+                },
+                {
+                    "target": self.btn_scan,
+                    "title": "7. 首次登录并开始扫描",
+                    "body": (
+                        "点击 Force Scan，在弹出的 Chrome 中选择科系并登录。"
+                        "每个需要监控的科系分别执行一次；之后程序就能按设定"
+                        "频率在后台静默巡逻。"
+                    ),
+                },
+                {
+                    "target": self.left_panel_widget,
+                    "title": "8. 查看和管理课程",
+                    "body": (
+                        "扫描到的课程会显示在左侧。双击课程可打开对应的下载"
+                        "文件夹；选择课程后点击 Remove Selected，会在确认后"
+                        "停止监控，并把已下载的课程文件夹移入回收站。"
+                    ),
+                },
+            ],
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.onboarding_checked:
+            return
+        self.onboarding_checked = True
+        should_auto_start = (
+            not config_mgr.get("onboarding_completed", False)
+            and not config_mgr.get("setup_completed", False)
+        )
+        if should_auto_start:
+            QTimer.singleShot(
+                300,
+                lambda: self.start_user_guide(show_intro=True),
+            )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.spotlight_guide and self.spotlight_guide.isVisible():
+            self.spotlight_guide.setGeometry(self.rect())
+            self.spotlight_guide.refresh_geometry()
+
+    def show_program_intro(self):
+        intro = QMessageBox(self)
+        intro.setWindowTitle("欢迎使用 WBLE Agent")
+        intro.setIconPixmap(
+            QIcon(resource_path("utar_logo.png")).pixmap(64, 64)
+        )
+        intro.setText(
+            "<b style='font-size:18px'>你的 WBLE 自动课件管家</b>"
+        )
+        intro.setInformativeText(
+            "WBLE Agent 会按设定时间静默巡逻已登录的科系，自动下载"
+            "新增课件、比较课程页面变化，并用 AI 生成简洁的 Markdown "
+            "更新摘要。<br><br>"
+            "<b>首次使用只需完成：</b><br>"
+            "① 填写至少一个 AI Key<br>"
+            "② 选择下载位置和扫描频率<br>"
+            "③ 保存设置<br>"
+            "④ 点击 Force Scan，选择科系并完成首次登录<br><br>"
+            "登录状态只保存在你的电脑；每个需要监控的科系首次分别"
+            "登录一次即可。"
+        )
+        start_button = intro.addButton(
+            "开始设置",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        intro.addButton(
+            "稍后再说",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        intro.exec()
+        return intro.clickedButton() is start_button
+
+    def start_user_guide(self, show_intro=False):
+        if self.scan_task and not self.scan_task.done():
+            QMessageBox.information(
+                self,
+                "扫描正在进行",
+                "请等待当前扫描完成后再打开用户导览。",
+            )
+            return
+        if self.spotlight_guide and self.spotlight_guide.isVisible():
+            self.spotlight_guide.raise_()
+            return
+        if show_intro and not self.show_program_intro():
+            return
+        config_mgr.set("onboarding_completed", True)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(80, self.spotlight_guide.start)
 
     def toggle_sidebar(self):
         # Teams style collapse/expand using QPropertyAnimation
@@ -1017,8 +1440,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少 API 密钥", "【必填】请在右侧至少填写一个 AI 引擎的 API 密钥 (GitHub / Groq / Kimi / Gemini)！\n否则软件无法为你自动总结课件。")
             return False
 
-        if openai_key and not (openai_key.startswith("github_pat_") or openai_key.startswith("ghp_")):
-            QMessageBox.warning(self, "格式错误", "GitHub Token 格式似乎不对！\n正常应该以 github_pat_ 或 ghp_ 开头，请参考旁边的 'i' 教程重新获取。")
+        if openai_key and not is_github_classic_token(openai_key):
+            QMessageBox.warning(
+                self,
+                "格式错误",
+                "这里只接受以 ghp_ 开头的 GitHub Personal Access "
+                "Token (classic)。\n请点击旁边的 i，按照 Classic Token "
+                "教程重新获取。",
+            )
             return False
             
         if kimi_key and not kimi_key.startswith("sk-"):

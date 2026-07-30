@@ -24,6 +24,11 @@ The application is designed for Windows 10/11 and runs from the system tray.
   - **Background Scan:** launches a headless browser and scans silently without
     stealing keyboard focus.
 - **Scheduled patrols:** choose 30 minutes, 1 hour, 4 hours, or 12 hours.
+- **First-run guidance:** a short introduction explains the application, then
+  an interactive spotlight walks through the AI key, download location,
+  optional WeChat notifications, interval, Silent Startup, Save Preferences,
+  Force Scan, and the monitored-course sidebar. The **用户导览** button can
+  replay it at any time.
 - **Multiple faculties/campuses:** repeat Force Scan once for each WBLE entry.
   Each entry receives an isolated authorization state. Scheduled and startup
   patrols scan up to two entries concurrently; a failure or expired login in
@@ -98,7 +103,10 @@ retained.
 
 The following AI providers are supported:
 
-- **GitHub Models:** a GitHub PAT with model-read permission.
+- **GitHub Models:** a Personal Access Token (classic) beginning with `ghp_`.
+  Create it from **Settings → Developer settings → Personal access tokens →
+  Tokens (classic)** and grant only the minimum access needed. The application
+  intentionally rejects fine-grained `github_pat_` tokens.
 - **Groq:** an API key beginning with `gsk_`.
 - **Google Gemini:** an AI Studio API key.
 - **Kimi / Moonshot:** an API key beginning with `sk-`.
