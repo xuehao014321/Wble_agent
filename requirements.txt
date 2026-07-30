@@ -10,3 +10,4 @@ qasync==0.28.0
 pywin32==312
 PyInstaller==6.21.0
 requests==2.33.0
+certifi>=2024.12.14

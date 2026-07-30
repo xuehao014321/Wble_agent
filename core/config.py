@@ -29,7 +29,14 @@ DEFAULT_CONFIG = {
     "scan_interval_hours": 1,
     "scan_interval_str": "30 minutes",
     "auto_start": False,
+    "dashboard_url": "",
+    "dashboard_targets": [],
+    "dashboard_targets_version": 0,
+    "available_courses": [],
+    "last_scan_report": {},
+    "password_prompt_handled": False,
     "blacklisted_courses": [],
+    "blacklisted_course_keys": [],
     "theme": "dark"
 }
 

@@ -18,11 +18,19 @@ The application is designed for Windows 10/11 and runs from the system tray.
 ## Main Features
 
 - **Two scan modes**
-  - **Force Scan:** opens a visible browser for first-time login, expired
-    sessions, or manual verification.
+  - **Force Scan:** always opens the faculty/campus selector in a visible
+    browser. After login and password-save confirmation, the actual scan moves
+    to a protected headless browser so user interaction cannot corrupt it.
   - **Background Scan:** launches a headless browser and scans silently without
     stealing keyboard focus.
 - **Scheduled patrols:** choose 30 minutes, 1 hour, 4 hours, or 12 hours.
+- **Multiple faculties/campuses:** repeat Force Scan once for each WBLE entry.
+  Every registered target is then scanned sequentially during one scheduled
+  patrol. A failure in one target does not stop the others.
+  - **eWBLE-KPR:** FAS, FEd, THP, and FBF
+    (`https://ewble-kpr.utar.edu.my/login/index.php`)
+  - **WBLE-KPR:** FEGT, FICT, FSc, and FCS
+    (`https://wble-kpr.utar.edu.my/wble-kpr/login/index.php`)
 - **Startup scan:** when Silent Startup is enabled, Windows starts the agent in
   the tray and immediately performs one background scan.
 - **Login-session reuse:** WBLE cookies and the dedicated Chrome profile are
@@ -32,8 +40,9 @@ The application is designed for Windows 10/11 and runs from the system tray.
   `#middle-column` course area and ignores dynamic sidebar content such as
   recent activity, timestamps, and online users.
 - **Reliable downloads:** authenticated streaming downloads, configurable size
-  limits, partial-file cleanup, filename sanitization, and automatic retry
-  after network failures.
+  limits, partial-file cleanup, filename sanitization, automatic retry after
+  network failures, and local-file reconciliation that restores a downloaded
+  resource if the user accidentally deletes its local copy.
 - **AI fallback chain:** GitHub Models, Groq, Google Gemini, and Kimi can
   summarize confirmed course changes and organize downloaded material.
 - **Markdown and calendar output:** long course content is processed in chunks;
@@ -54,14 +63,31 @@ The application is designed for Windows 10/11 and runs from the system tray.
 3. Install Google Chrome if it is not already available.
 4. Run the EXE.
 5. Enter at least one supported AI key and click **Save Preferences**.
-6. Click **Force Scan Now** and complete the WBLE login in the visible browser.
-7. After the first successful scan, the scheduled background patrol can reuse
-   that login session.
+6. Click **Force Scan Now**, choose one faculty/campus, and complete the WBLE
+   login in the visible browser.
+7. Let Chrome show its native **Save password** prompt first. After handling
+   it, confirm the in-page WBLE Agent reminder; scanning then continues in a
+   protected background browser. WBLE Agent records only that the reminder
+   was handled; it never reads Chrome's password database.
+8. If your courses are split across another faculty/campus, click Force Scan
+   again and choose the other entry. It will be added instead of replacing the
+   first one.
+9. Scheduled background patrols now scan every registered entry.
 
 If a notification says the background browser requires login, open the main
 window and perform one Force Scan. The application does not need to click the
 page every 30 seconds; it keeps the browser profile and starts a fresh,
 authenticated browser for each scheduled scan.
+
+Registered targets are shown in Settings:
+
+- `○` — registered but not scanned yet
+- `✅` — the latest scan succeeded
+- `🔐` — login is required for this target
+- `⚠️` — the latest scan failed for another reason
+
+Removing a target only stops future monitoring for that entry. Existing
+downloaded files and historical course state are retained.
 
 ## Configuration
 
@@ -112,8 +138,10 @@ python -m compileall -q main.py core gui tests
 ```
 
 The regression tests cover DPAPI protection, atomic configuration recovery,
-course recognition, structured content diffs, calendar validation, and
-streaming download limits.
+course recognition, structured content diffs, calendar validation, streaming
+download limits, restoration checks for locally deleted course files,
+multi-target migration, same-name course isolation, and per-target failure
+handling.
 
 ## Build the Windows EXE
 

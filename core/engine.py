@@ -7,11 +7,13 @@ import json
 import hashlib
 import difflib
 import re
-import sqlite3
-import pathlib
 import uuid
+import http.client
 import urllib.request
 import urllib.parse
+import urllib.error
+import ssl
+import certifi
 from email.message import Message
 from email.utils import collapse_rfc2231_value
 from datetime import datetime, timezone
@@ -28,12 +30,120 @@ if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
 TARGET_URL = "https://wble.utar.edu.my/"
 AUTH_STATE_FILE = os.path.join(os.getcwd(), "wble_auth_state.json")
 SNAPSHOT_VERSION = 2
+TARGETS_VERSION = 2
+WBLE_PORTALS = {
+    "ewble-kpr.utar.edu.my": {
+        "login_url": "https://ewble-kpr.utar.edu.my/login/index.php",
+        "dashboard_url": "https://ewble-kpr.utar.edu.my/",
+        "label": "eWBLE-KPR — FAS / FEd / THP / FBF",
+    },
+    "wble-kpr.utar.edu.my": {
+        "login_url": (
+            "https://wble-kpr.utar.edu.my/wble-kpr/login/index.php"
+        ),
+        "dashboard_url": "https://wble-kpr.utar.edu.my/wble-kpr/",
+        "label": "WBLE-KPR — FEGT / FICT / FSc / FCS",
+    },
+}
 VOLATILE_QUERY_PARAMS = {
     "sesskey", "utm_source", "utm_medium", "utm_campaign", "utm_term",
     "utm_content", "fbclid", "gclid", "ouid", "rtpof", "sd", "usp"
 }
 
 # ================= 工具函数 =================
+
+
+def create_https_context():
+    """
+    Use an explicit CA bundle.
+
+    Some Windows/PyInstaller environments do not expose a usable OpenSSL
+    default CA file, even though Chrome can validate the same website.
+    """
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
+HTTPS_CONTEXT = create_https_context()
+
+
+def is_utar_https_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    hostname = (parsed.hostname or "").casefold()
+    return (
+        parsed.scheme.casefold() == "https"
+        and (
+            hostname == "utar.edu.my"
+            or hostname.endswith(".utar.edu.my")
+        )
+    )
+
+
+def is_certificate_verification_error(error):
+    reason = getattr(error, "reason", error)
+    return (
+        isinstance(reason, ssl.SSLCertVerificationError)
+        or "CERTIFICATE_VERIFY_FAILED" in str(reason)
+    )
+
+
+class SelectiveHttpsHandler(urllib.request.HTTPSHandler):
+    """
+    Ignore a broken TLS chain only for UTAR hosts.
+
+    Redirects to external storage return to the normal verified context.
+    """
+
+    def https_open(self, request):
+        if is_utar_https_url(request.full_url):
+            context = ssl._create_unverified_context()
+        else:
+            context = HTTPS_CONTEXT
+        return self.do_open(
+            http.client.HTTPSConnection,
+            request,
+            context=context,
+        )
+
+
+class CookieSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self, request, file_pointer, code, message, headers, new_url
+    ):
+        redirected = super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+        if redirected is None:
+            return None
+        old_host = (urllib.parse.urlsplit(request.full_url).hostname or "").casefold()
+        new_host = (urllib.parse.urlsplit(new_url).hostname or "").casefold()
+        if old_host != new_host:
+            redirected.remove_header("Cookie")
+        return redirected
+
+
+def open_https_with_utar_fallback(request, timeout):
+    try:
+        return urllib.request.urlopen(
+            request, timeout=timeout, context=HTTPS_CONTEXT
+        )
+    except urllib.error.URLError as error:
+        if not (
+            is_utar_https_url(request.full_url)
+            and is_certificate_verification_error(error)
+        ):
+            raise
+        print(
+            "      🔐 WBLE 证书链不完整；仅对此 UTAR 地址启用兼容下载。",
+            flush=True,
+        )
+        opener = urllib.request.build_opener(
+            CookieSafeRedirectHandler(),
+            SelectiveHttpsHandler(),
+        )
+        return opener.open(request, timeout=timeout)
+
 
 async def send_wechat_notification(title, desp):
     serverchan_key = config_mgr.get("serverchan_key", "")
@@ -45,7 +155,9 @@ async def send_wechat_notification(title, desp):
     req = urllib.request.Request(url, data=data)
     try:
         await asyncio.to_thread(
-            lambda: urllib.request.urlopen(req, timeout=20).read()
+            lambda: urllib.request.urlopen(
+                req, timeout=20, context=HTTPS_CONTEXT
+            ).read()
         )
         print("✅ 微信推送成功！", flush=True)
     except Exception as e:
@@ -88,49 +200,42 @@ def chunk_text_by_lines(text, max_chars=12000):
     return chunks or [""]
 
 
-def has_saved_wble_credentials(user_data_dir):
-    """
-    Check whether Chrome has a saved UTAR login without reading or decrypting
-    the username/password values.
-    """
-    profile_dirs = [os.path.join(user_data_dir, "Default")]
+def enable_chrome_password_manager(user_data_dir):
+    """Enable Chrome's native save-password prompt for the app profile."""
+    preferences_path = os.path.join(
+        user_data_dir, "Default", "Preferences"
+    )
     try:
-        profile_dirs.extend(
-            os.path.join(user_data_dir, name)
-            for name in os.listdir(user_data_dir)
-            if name.startswith("Profile ")
-        )
-    except OSError:
-        pass
+        preferences = {}
+        if os.path.isfile(preferences_path):
+            with open(preferences_path, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if isinstance(loaded, dict):
+                preferences = loaded
 
-    for profile_dir in profile_dirs:
-        for database_name in ("Login Data", "Login Data For Account"):
-            database_path = os.path.join(profile_dir, database_name)
-            if not os.path.isfile(database_path):
-                continue
-            try:
-                database_uri = (
-                    pathlib.Path(database_path).resolve().as_uri() + "?mode=ro"
-                )
-                with sqlite3.connect(database_uri, uri=True, timeout=1) as database:
-                    found = database.execute(
-                        """
-                        SELECT 1
-                        FROM logins
-                        WHERE blacklisted_by_user = 0
-                          AND length(password_value) > 0
-                          AND (
-                              instr(lower(origin_url), 'utar.edu.my') > 0
-                              OR instr(lower(signon_realm), 'utar.edu.my') > 0
-                          )
-                        LIMIT 1
-                        """
-                    ).fetchone()
-                if found:
-                    return True
-            except (OSError, sqlite3.Error):
-                continue
-    return False
+        preferences["credentials_enable_service"] = True
+        profile_preferences = preferences.setdefault("profile", {})
+        if not isinstance(profile_preferences, dict):
+            profile_preferences = {}
+            preferences["profile"] = profile_preferences
+        profile_preferences["password_manager_enabled"] = True
+
+        os.makedirs(os.path.dirname(preferences_path), exist_ok=True)
+        atomic_write_text(
+            preferences_path,
+            json.dumps(
+                preferences,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        return True
+    except (OSError, ValueError, TypeError) as error:
+        print(
+            f"⚠️ 无法预先开启 Chrome 保存密码功能: {error}",
+            flush=True,
+        )
+        return False
 
 
 def normalize_text(text):
@@ -171,6 +276,192 @@ def canonicalize_url(url):
         ))
     except Exception:
         return url.strip()
+
+
+def known_wble_portal(url):
+    hostname = (
+        urllib.parse.urlsplit(url).hostname or ""
+    ).casefold()
+    return WBLE_PORTALS.get(hostname)
+
+
+def canonical_dashboard_target_url(url):
+    """
+    Collapse login, /my, and redirected pages onto one portal dashboard.
+
+    The two Kampar systems are independent targets even though their names and
+    login flows are similar.
+    """
+    portal = known_wble_portal(url)
+    if portal:
+        return portal["dashboard_url"]
+    return canonicalize_url(url)
+
+
+def dashboard_target_id(url):
+    """Return a stable, privacy-safe identifier for one WBLE dashboard."""
+    normalized_url = canonical_dashboard_target_url(url)
+    return hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:16]
+
+
+def dashboard_target_label(url, page_title=""):
+    """Build a readable target label without relying on a specific faculty DOM."""
+    portal = known_wble_portal(url)
+    if portal:
+        return portal["label"]
+    title = normalize_text(page_title).split("\n", 1)[0].strip()
+    generic_titles = {
+        "wble", "utar wble", "universiti tunku abdul rahman",
+    }
+    if title and title.casefold() not in generic_titles:
+        return title[:80]
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.netloc or "WBLE"
+    path = parsed.path.strip("/")
+    return f"{host} / {path}"[:80] if path else host[:80]
+
+
+def normalize_dashboard_targets(raw_targets=None, legacy_url=""):
+    """
+    Normalize, de-duplicate, and migrate dashboard target configuration.
+
+    The legacy single ``dashboard_url`` is included automatically so upgrading
+    users do not lose their only registered faculty/campus.
+    """
+    candidates = list(raw_targets) if isinstance(raw_targets, list) else []
+    if legacy_url:
+        candidates.append({"url": legacy_url})
+
+    targets = []
+    seen_urls = set()
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            candidate = {"url": candidate}
+        if not isinstance(candidate, dict):
+            continue
+        url = canonical_dashboard_target_url(candidate.get("url", ""))
+        if (
+            not url
+            or "wble" not in urllib.parse.urlsplit(url).netloc.casefold()
+            or url.rstrip("/") == TARGET_URL.rstrip("/")
+            or url in seen_urls
+        ):
+            continue
+        seen_urls.add(url)
+        target = {
+            "id": dashboard_target_id(url),
+            "url": url,
+            "label": (
+                dashboard_target_label(url)
+                if known_wble_portal(url)
+                else (
+                    normalize_text(candidate.get("label", ""))
+                    or dashboard_target_label(url)
+                )
+            ),
+            "version": TARGETS_VERSION,
+        }
+        if candidate.get("last_status") in {
+            "ok", "login_required", "error", "never"
+        }:
+            target["last_status"] = candidate["last_status"]
+        if candidate.get("last_checked_at"):
+            target["last_checked_at"] = str(
+                candidate["last_checked_at"]
+            )
+        if candidate.get("last_error"):
+            target["last_error"] = str(candidate["last_error"])[:120]
+        targets.append(target)
+    return targets
+
+
+def get_dashboard_targets():
+    """Load targets and persist a one-time migration from dashboard_url."""
+    migrated = config_mgr.get("dashboard_targets_version", 0) >= TARGETS_VERSION
+    raw_targets = config_mgr.get("dashboard_targets", [])
+    if not migrated:
+        raw_targets = (
+            list(raw_targets) if isinstance(raw_targets, list) else []
+        )
+        raw_targets.extend(
+            {"url": portal["dashboard_url"]}
+            for portal in WBLE_PORTALS.values()
+        )
+    targets = normalize_dashboard_targets(
+        raw_targets,
+        "" if migrated else config_mgr.get("dashboard_url", ""),
+    )
+    if (
+        targets != config_mgr.get("dashboard_targets", [])
+        or not migrated
+    ):
+        config_mgr.update({
+            "dashboard_targets": targets,
+            "dashboard_targets_version": TARGETS_VERSION,
+            "dashboard_url": targets[-1]["url"] if targets else "",
+        })
+    return targets
+
+
+def register_dashboard_target(url, page_title=""):
+    """Add or refresh one selected faculty/campus without replacing others."""
+    url = canonical_dashboard_target_url(url)
+    targets = get_dashboard_targets()
+    target = {
+        "id": dashboard_target_id(url),
+        "url": url,
+        "label": dashboard_target_label(url, page_title),
+        "version": TARGETS_VERSION,
+    }
+    if any(
+        existing["url"] != url
+        and existing.get("label") == target["label"]
+        for existing in targets
+    ):
+        target["label"] = (
+            f"{target['label']} [{target['id'][:6]}]"
+        )
+    replaced = False
+    for index, existing in enumerate(targets):
+        if existing["url"] == url:
+            for status_key in (
+                "last_status", "last_checked_at", "last_error"
+            ):
+                if status_key in existing:
+                    target[status_key] = existing[status_key]
+            targets[index] = target
+            replaced = True
+            break
+    if not replaced:
+        targets.append(target)
+    config_mgr.update({
+        "dashboard_targets": targets,
+        "dashboard_targets_version": TARGETS_VERSION,
+        # Retain the legacy field for downgrade compatibility and use it as
+        # the most recently selected target during protected login hand-off.
+        "dashboard_url": url,
+    })
+    return target
+
+
+def course_state_key(course_url):
+    """Identify a course by canonical URL, not its potentially duplicated name."""
+    normalized_url = canonicalize_url(course_url)
+    return f"course:{hashlib.sha256(normalized_url.encode('utf-8')).hexdigest()[:20]}"
+
+
+def unique_course_folder_name(course_name, course_key, state_db):
+    """Keep legacy folder names while disambiguating genuinely duplicated names."""
+    safe_name = re.sub(r'[\\/*?:"<>|]', "_", course_name).strip() or "Course"
+    for existing_key, existing_state in state_db.items():
+        if existing_key == course_key or not isinstance(existing_state, dict):
+            continue
+        if (
+            existing_state.get("course_name") == course_name
+            and existing_state.get("folder_name") == safe_name
+        ):
+            return f"{safe_name} [{course_key.split(':')[-1][:6]}]"
+    return safe_name
 
 
 def get_snapshot_hash(snapshot):
@@ -674,6 +965,14 @@ class FileTooLargeError(Exception):
     pass
 
 
+class DashboardLoginRequired(RuntimeError):
+    def __init__(self, target):
+        self.target = target
+        super().__init__(
+            f"Login required for {target.get('label', target.get('url', 'WBLE'))}"
+        )
+
+
 def safe_download_filename(filename, fallback="downloaded_file"):
     filename = urllib.parse.unquote(str(filename or ""))
     filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
@@ -726,7 +1025,7 @@ def _fetch_url_to_temp(
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.part")
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with open_https_with_utar_fallback(request, timeout=60) as response:
             final_url = response.geturl()
             content_type = response.headers.get_content_type()
             declared_size = response.headers.get("Content-Length")
@@ -815,7 +1114,7 @@ async def place_downloaded_file(result, files_dir, link_text):
     if extension in {"mp4", "mkv", "avi", "mov"}:
         os.remove(temp_path)
         print(f"        ⚠️ 按策略跳过视频: {filename}", flush=True)
-        return True, 0, True
+        return True, 0, True, None
 
     category = smart_categorize_local(filename, link_text)
     if not category:
@@ -841,15 +1140,79 @@ async def place_downloaded_file(result, files_dir, link_text):
 
     if os.path.exists(save_path):
         os.remove(temp_path)
+        relative_path = os.path.relpath(
+            save_path, files_dir
+        ).replace(os.sep, "/")
         print(
             f"        ⏭️ 硬盘上已存在，跳过下载: {category}/{filename}",
             flush=True,
         )
-        return True, 0, ai_ok
+        return True, 0, ai_ok, relative_path
 
     os.replace(temp_path, save_path)
+    relative_path = os.path.relpath(
+        save_path, files_dir
+    ).replace(os.sep, "/")
     print(f"        ✅ 下载完成: {category}/{filename}", flush=True)
-    return True, 1, ai_ok
+    return True, 1, ai_ok, relative_path
+
+
+def tracked_resource_files_exist(course_dir, course_state, resource_key):
+    """
+    A database completion record is valid only while every mapped local file
+    still exists inside this course folder.
+
+    ``None`` is an explicit no-file record for policy-skipped resources such as
+    videos. A missing mapping is legacy/unknown and must be rechecked.
+    """
+    file_map = course_state.get("downloaded_file_paths", {})
+    if not isinstance(file_map, dict) or resource_key not in file_map:
+        return False
+
+    relative_paths = file_map[resource_key]
+    if relative_paths is None:
+        return True
+    if not isinstance(relative_paths, list) or not relative_paths:
+        return False
+
+    files_root = os.path.abspath(os.path.join(course_dir, "Files"))
+    for relative_path in relative_paths:
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            return False
+        candidate = os.path.abspath(
+            os.path.join(files_root, *relative_path.replace("\\", "/").split("/"))
+        )
+        try:
+            if (
+                os.path.commonpath([files_root, candidate]) != files_root
+                or not os.path.isfile(candidate)
+            ):
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def remap_tracked_download_path(course_state, old_path, new_path):
+    """Keep resource-to-file mappings valid when self-healing moves a file."""
+    file_map = course_state.get("downloaded_file_paths", {})
+    if not isinstance(file_map, dict):
+        return 0
+
+    old_normalized = str(old_path).replace("\\", "/")
+    new_normalized = str(new_path).replace("\\", "/")
+    updated = 0
+    for resource_key, relative_paths in file_map.items():
+        if not isinstance(relative_paths, list):
+            continue
+        replacement = [
+            new_normalized if path == old_normalized else path
+            for path in relative_paths
+        ]
+        if replacement != relative_paths:
+            file_map[resource_key] = sorted(set(replacement))
+            updated += 1
+    return updated
 
 
 async def download_from_current_page(page, course_dir, state_db, course_name):
@@ -871,28 +1234,53 @@ async def download_from_current_page(page, course_dir, state_db, course_name):
 
         if not resource_key:
             continue
-        if resource_key in state_db[course_name]["downloaded_files"]:
+        course_state = state_db[course_name]
+        completed_resources = course_state["downloaded_files"]
+        file_map = course_state.setdefault("downloaded_file_paths", {})
+        if resource_key in completed_resources:
+            if tracked_resource_files_exist(
+                course_dir, course_state, resource_key
+            ):
+                print(
+                    f"      ⏭️ 数据库与本地文件一致: {link_text[:40]}",
+                    flush=True,
+                )
+                continue
+
+            # The user may have deleted a file manually or restored an older
+            # folder. The filesystem is the source of truth, so invalidate only
+            # this completion record and fetch it again.
+            completed_resources[:] = [
+                key for key in completed_resources if key != resource_key
+            ]
+            file_map.pop(resource_key, None)
             print(
-                f"      ⏭️ 数据库中已有完成记录: {link_text[:40]}",
+                f"      ♻️ 数据库有记录但本地文件缺失，自动重新下载: "
+                f"{link_text[:40]}",
                 flush=True,
             )
-            continue
 
         print(
             f"      ⬇️ [发现目标] 流式下载检查... ({link_text[:30]})",
             flush=True,
         )
         resource_complete = True
+        resource_paths = []
         try:
             result = await fetch_url_to_temp(
                 page, href, temp_dir, max_size_bytes, allow_html=True
             )
             if result["kind"] == "file":
-                placed_ok, added, classification_ok = await place_downloaded_file(
-                    result, files_dir, link_text
-                )
+                (
+                    placed_ok,
+                    added,
+                    classification_ok,
+                    relative_path,
+                ) = await place_downloaded_file(result, files_dir, link_text)
                 resource_complete = placed_ok
                 new_files_count += added
+                if relative_path:
+                    resource_paths.append(relative_path)
                 if not classification_ok:
                     state_db[course_name]["has_unclassified_files"] = True
             else:
@@ -918,13 +1306,20 @@ async def download_from_current_page(page, course_dir, state_db, course_name):
                             max_size_bytes,
                             allow_html=False,
                         )
-                        placed_ok, added, classification_ok = (
+                        (
+                            placed_ok,
+                            added,
+                            classification_ok,
+                            relative_path,
+                        ) = (
                             await place_downloaded_file(
                             file_result, files_dir, link_text
                             )
                         )
                         resource_complete = resource_complete and placed_ok
                         new_files_count += added
+                        if relative_path:
+                            resource_paths.append(relative_path)
                         if not classification_ok:
                             state_db[course_name][
                                 "has_unclassified_files"
@@ -954,7 +1349,11 @@ async def download_from_current_page(page, course_dir, state_db, course_name):
             )
 
         if resource_complete:
-            state_db[course_name]["downloaded_files"].append(resource_key)
+            if resource_key not in completed_resources:
+                completed_resources.append(resource_key)
+            # None explicitly means this resource intentionally produces no
+            # local file (for example, a video skipped by policy).
+            file_map[resource_key] = sorted(set(resource_paths)) or None
 
     if os.path.isdir(temp_dir) and not os.listdir(temp_dir):
         os.rmdir(temp_dir)
@@ -1111,8 +1510,16 @@ async def extract_course_snapshot(page, course_name):
     return snapshot, ""
 
 
-async def deep_scan_course(page, course_link, course_dir, state_db, course_name):
+async def deep_scan_course(
+    page,
+    course_link,
+    course_dir,
+    state_db,
+    course_name,
+    state_key=None,
+):
     """Scan the course homepage and linked content pages."""
+    state_key = state_key or course_name
     await page.goto(course_link, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
 
@@ -1138,7 +1545,7 @@ async def deep_scan_course(page, course_link, course_dir, state_db, course_name)
         )
 
     total_new_files = await download_from_current_page(
-        page, course_dir, state_db, course_name
+        page, course_dir, state_db, state_key
     )
 
     # Include content-bearing activity pages. Their resource links are downloaded,
@@ -1166,7 +1573,7 @@ async def deep_scan_course(page, course_link, course_dir, state_db, course_name)
             await page.goto(sub_href, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
             total_new_files += await download_from_current_page(
-                page, course_dir, state_db, course_name
+                page, course_dir, state_db, state_key
             )
         except Exception:
             print("      ⚠️ 深潜失败，跳过该子页面", flush=True)
@@ -1200,26 +1607,46 @@ class WBLEScanner:
         self.playwright = None
         self.context = None
         self.page = None
-        self.has_saved_wble_credentials = False
+        self.password_prompt_handled = False
+        self.last_scan_report = {}
         
     async def init_browser(self, is_background=False):
         print(f"🤖 初始化浏览器引擎 (后台模式={is_background})...", flush=True)
         user_data_dir = os.path.join(os.getcwd(), "chrome_data")
-        self.has_saved_wble_credentials = has_saved_wble_credentials(
-            user_data_dir
+        profile_exists = os.path.isfile(
+            os.path.join(user_data_dir, "Default", "Preferences")
         )
-        if self.has_saved_wble_credentials:
+        self.password_prompt_handled = bool(
+            config_mgr.get("password_prompt_handled", False)
+            and profile_exists
+        )
+        if self.password_prompt_handled:
             print(
-                "🔐 当前 Chrome profile 已保存 WBLE 登录凭据。",
+                "🔐 用户已处理过 Chrome 保存密码提示。",
                 flush=True
             )
+        elif not is_background:
+            enable_chrome_password_manager(user_data_dir)
+            print(
+                "🔑 已开启 Chrome 原生保存密码提示。",
+                flush=True,
+            )
+        launch_options = {
+            "headless": is_background,
+            "ignore_https_errors": True,
+        }
+        if not is_background:
+            # Visible Force Scan behaves like a normal Chrome app window so
+            # native browser UI such as Save Password is allowed to appear.
+            launch_options["ignore_default_args"] = [
+                "--enable-automation"
+            ]
         self.playwright = await async_playwright().start()
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=is_background,
                 channel="chrome",
-                ignore_https_errors=True
+                **launch_options,
             )
         except Exception as chrome_error:
             print(
@@ -1230,8 +1657,7 @@ class WBLEScanner:
                 self.context = (
                     await self.playwright.chromium.launch_persistent_context(
                         user_data_dir,
-                        headless=is_background,
-                        ignore_https_errors=True,
+                        **launch_options,
                     )
                 )
             except Exception as chromium_error:
@@ -1257,11 +1683,21 @@ class WBLEScanner:
 
     async def wait_for_password_save_confirmation(self, page):
         """
-        Pause after an interactive login so Chrome's password prompt is not
-        interrupted by the scanner immediately navigating away.
+        Leave Chrome completely untouched while its native password bubble is
+        visible, then show the in-page continuation reminder.
         """
         overlay_id = "wble-agent-login-confirmation"
         try:
+            # The native Chrome password bubble is outside the web page and
+            # Playwright cannot reliably query it. Do not issue any page/CDP
+            # action during this grace period because doing so can collapse
+            # Chrome's transient browser UI.
+            print(
+                "🔐 登录成功。自动化已暂停 3 秒，请立即处理 Chrome "
+                "右上角的“保存密码”界面…",
+                flush=True,
+            )
+            await asyncio.sleep(3)
             await page.evaluate(
                 '''overlayId => {
                     document.getElementById(overlayId)?.remove();
@@ -1297,7 +1733,7 @@ class WBLEScanner:
 
                     const message = document.createElement("div");
                     message.textContent =
-                        "请先处理 Chrome 右上角的“保存密码”提示。完成后点击下方按钮，WBLE Agent 才会开始扫描。";
+                        "请先处理 Chrome 右上角的“保存密码”提示。如果气泡已经收起，可点击地址栏右侧的钥匙图标重新打开。完成后点击下方按钮继续。";
                     message.style.cssText =
                         "font-size:15px;line-height:1.65;color:#526078;margin-bottom:22px";
 
@@ -1323,20 +1759,24 @@ class WBLEScanner:
                 overlay_id
             )
             print(
-                "🔑 登录成功。扫描已暂停，请先处理 Chrome 的保存密码提示，"
+                "🔑 Chrome 保存密码界面已优先显示。扫描仍暂停；"
+                "请先处理保存密码提示，"
                 "再点击网页中的“我已处理，开始扫描”。",
                 flush=True
             )
             await page.wait_for_function(
                 "overlayId => !document.getElementById(overlayId)",
                 arg=overlay_id,
-                timeout=120000
+                timeout=600000
             )
+            config_mgr.set("password_prompt_handled", True)
+            self.password_prompt_handled = True
             print("▶️ 用户已确认，继续执行扫描。", flush=True)
+            return True
         except Exception as error:
             print(
                 f"⚠️ 登录确认提示未完成 ({type(error).__name__})，"
-                "等待结束后继续扫描。",
+                "本轮扫描已停止，不会跳过保存密码步骤。",
                 flush=True
             )
             try:
@@ -1345,36 +1785,166 @@ class WBLEScanner:
                 )
             except Exception:
                 pass
+            return False
+
+    async def switch_to_protected_scan_context(self):
+        """Close interactive Chrome and continue the scan in headless mode."""
+        print(
+            "🛡️ 登录步骤完成，正在关闭可交互页面并切换到受保护扫描模式…",
+            flush=True,
+        )
+        await self.cleanup()
+        # Give Chrome time to flush cookies and password-manager changes and
+        # fully release the persistent profile lock.
+        await asyncio.sleep(0.5)
+        await self.init_browser(is_background=True)
+        logged_in = await self.wait_for_login(is_background=True)
+        if logged_in:
+            print(
+                "🔒 受保护扫描模式已启动；扫描期间用户无法干扰网页步骤。",
+                flush=True,
+            )
+        return logged_in
+
+    async def is_authenticated_wble_page(self, page):
+        current_url = page.url
+        if (
+            "wble" not in current_url.casefold()
+            or ".utar.edu.my" not in current_url.casefold()
+            or "login" in current_url.casefold()
+            or current_url.rstrip("/") == TARGET_URL.rstrip("/")
+        ):
+            return False
+        try:
+            logout_count = await page.locator(
+                "a[href*='logout.php']"
+            ).count()
+            course_count = await page.locator(
+                "a[href*='course/view.php']"
+            ).count()
+            return logout_count > 0 or course_count > 0
+        except Exception:
+            return False
+
+    async def find_background_login(self):
+        """
+        Find any usable registered target.
+
+        Failure of one target must not prevent the scan cycle from trying the
+        remaining targets independently.
+        """
+        targets = get_dashboard_targets()
+        if not targets:
+            print(
+                "⚠️ 尚未登记任何科系/校区，请先执行一次 Force Scan。",
+                flush=True,
+            )
+            return False
+
+        probe_failures = []
+        for target in targets:
+            print(
+                f"👻 后台验证科系/校区: {target['label']}",
+                flush=True,
+            )
+            try:
+                await self.page.goto(
+                    target["url"], wait_until="domcontentloaded"
+                )
+                for _ in range(5):
+                    if await self.is_authenticated_wble_page(self.page):
+                        print(
+                            f"✅ 已找到可用登录会话: {target['label']}",
+                            flush=True,
+                        )
+                        return True
+                    await asyncio.sleep(1)
+                probe_failures.append({
+                    **target,
+                    "reason": "login_required",
+                })
+            except Exception as error:
+                probe_failures.append({
+                    **target,
+                    "reason": type(error).__name__,
+                })
+                print(
+                    f"⚠️ {target['label']} 登录验证失败: "
+                    f"{type(error).__name__}",
+                    flush=True,
+                )
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        failure_by_id = {
+            failure["id"]: failure for failure in probe_failures
+        }
+        updated_targets = []
+        for target in targets:
+            failure = failure_by_id.get(target["id"], {})
+            reason = failure.get("reason", "login_required")
+            updated_target = {
+                **target,
+                "last_checked_at": checked_at,
+                "last_status": (
+                    "login_required"
+                    if reason == "login_required"
+                    else "error"
+                ),
+                "last_error": reason,
+            }
+            updated_targets.append(updated_target)
+        report = {
+            "finished_at": checked_at,
+            "targets_total": len(targets),
+            "targets_ok": 0,
+            "targets_failed": probe_failures,
+            "courses_seen": 0,
+            "updates_found": 0,
+        }
+        config_mgr.update({
+            "dashboard_targets": updated_targets,
+            "dashboard_targets_version": TARGETS_VERSION,
+            "last_scan_report": report,
+        })
+        self.last_scan_report = report
+        print(
+            "⚠️ 所有已登记科系/校区都需要重新登录。",
+            flush=True,
+        )
+        return False
 
     async def wait_for_login(self, is_background=False):
-        manual_login_page_seen = False
         if is_background:
-            # 后台没有用户可以选择校区，因此必须直接进入上次登录成功后
-            # 保存下来的校区主页，不能从 WBLE 公共入口开始。
-            login_check_url = config_mgr.get("dashboard_url", TARGET_URL)
-            print(f"👻 正在后台验证已保存的 WBLE 会话: {login_check_url}", flush=True)
-        else:
-            # Once a campus has been selected, go there directly. This lets the
-            # persistent Chrome profile reuse its cookies and saved credentials.
-            login_check_url = config_mgr.get("dashboard_url", "") or TARGET_URL
-            print("\n" + "❗"*25, flush=True)
-            print("🛑 登录状态检查：", flush=True)
-            if login_check_url == TARGET_URL:
-                print("👉 请在浏览器里选择校区并完成登录。", flush=True)
-                print(
-                    "👉 ⚠️ 选择校区后弹出新标签页属于正常现象。",
-                    flush=True
-                )
-            else:
-                print(
-                    f"👉 正在直接打开上次使用的校区: {login_check_url}",
-                    flush=True
-                )
-            print(
-                "👉 如出现登录页，请完成登录；程序会等待你处理保存密码提示。",
-                flush=True
-            )
-            print("❗"*25 + "\n", flush=True)
+            return await self.find_background_login()
+
+        # Manual scans must always begin at the faculty/campus selector.
+        # Some students have courses under more than one faculty, so silently
+        # reusing the previous dashboard would hide the choice from them.
+        login_check_url = TARGET_URL
+        # A persistent Chrome profile may restore an old faculty dashboard
+        # in another tab. Close those stale tabs first; otherwise the login
+        # detector could accept one immediately and bypass the selector.
+        for stale_page in list(self.context.pages):
+            if stale_page is not self.page:
+                try:
+                    await stale_page.close()
+                except Exception:
+                    pass
+        print("\n" + "❗"*25, flush=True)
+        print("🛑 登录状态检查：", flush=True)
+        print(
+            "👉 请选择一个要登记或重新授权的科系/校区。",
+            flush=True,
+        )
+        print(
+            "👉 ⚠️ 选择科系/校区后弹出新标签页属于正常现象。",
+            flush=True,
+        )
+        print(
+            "👉 如出现登录页，请完成登录；程序会等待你处理保存密码提示。",
+            flush=True
+        )
+        print("❗"*25 + "\n", flush=True)
 
         await self.page.goto(login_check_url, wait_until="domcontentloaded")
 
@@ -1387,33 +1957,47 @@ class WBLEScanner:
             all_pages = self.context.pages
             for p in all_pages:
                 current_url = p.url
-                if not is_background and "login" in current_url.lower():
-                    manual_login_page_seen = True
                 if ("wble" in current_url and ".utar.edu.my" in current_url 
                         and "login" not in current_url 
                         and current_url.rstrip("/") != "https://wble.utar.edu.my"):
                     try:
-                        logout_count = await p.locator("a[href*='logout.php']").count()
-                        course_count = await p.locator("a[href*='course/view.php']").count()
-                        if logout_count > 0 or course_count > 0:
+                        if await self.is_authenticated_wble_page(p):
                             print("\n✅ 已自动检测到登录成功！", flush=True)
-                            config_mgr.set("dashboard_url", current_url)
+                            self.page = p
+                            prompt_was_needed = (
+                                not is_background
+                                and not self.password_prompt_handled
+                            )
+                            if prompt_was_needed:
+                                confirmed = (
+                                    await self.wait_for_password_save_confirmation(p)
+                                )
+                                if not confirmed:
+                                    return False
+
+                            # Password handling must finish before any title,
+                            # storage-state, or registration operation touches
+                            # the newly authenticated browser tab.
+                            try:
+                                page_title = await p.title()
+                            except Exception:
+                                page_title = ""
+                            target = register_dashboard_target(
+                                current_url, page_title
+                            )
                             await self.context.storage_state(path=AUTH_STATE_FILE)
-                            print("🔐 登录状态已安全保存，供下次后台巡逻使用。", flush=True)
-                            self.page = p  # 切换主控页面到登录成功的那个标签页
+                            print(
+                                f"🔐 已登记扫描目标: {target['label']} "
+                                f"(共 {len(get_dashboard_targets())} 个)",
+                                flush=True,
+                            )
                             if (
                                 not is_background
-                                and manual_login_page_seen
-                                and not self.has_saved_wble_credentials
-                            ):
-                                await self.wait_for_password_save_confirmation(p)
-                            elif (
-                                not is_background
-                                and manual_login_page_seen
-                                and self.has_saved_wble_credentials
+                                and not prompt_was_needed
+                                and self.password_prompt_handled
                             ):
                                 print(
-                                    "🔐 已检测到保存过的 WBLE 密码，"
+                                    "🔐 用户已处理过 Chrome 保存密码提示，"
                                     "跳过保存密码提醒。",
                                     flush=True
                                 )
@@ -1431,46 +2015,78 @@ class WBLEScanner:
         return False
 
         
-    async def run_scan_cycle(self):
-        state_db = config_mgr.state
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🚀 开始执行深度巡逻...", flush=True)
-        dashboard_url = config_mgr.get("dashboard_url", "https://wble.utar.edu.my/")
-        await self.page.goto(dashboard_url)
+    async def scan_dashboard_target(self, target, state_db):
+        """Scan one target; orchestration keeps failures isolated per target."""
+        print(f"\n🏫 正在巡逻科系/校区: {target['label']}", flush=True)
+        await self.page.goto(
+            target["url"], wait_until="domcontentloaded"
+        )
         await self.page.wait_for_timeout(2000)
+        if not await self.is_authenticated_wble_page(self.page):
+            raise DashboardLoginRequired(target)
         
         courses = await extract_course_links(self.page)
-        
-        # update available courses in config to show in GUI
-        config_mgr.set("available_courses", list(courses.keys()))
-        
+        course_records = []
         updates_found = []
         for name, link in courses.items():
+            course_key = course_state_key(link)
+            course_record = {
+                "key": course_key,
+                "name": name,
+                "url": canonicalize_url(link),
+                "target_id": target["id"],
+                "target_label": target["label"],
+            }
+            course_records.append(course_record)
+            if course_key in config_mgr.get("blacklisted_course_keys", []):
+                print(f"⏭️ 已忽略课程: {name[:40]}", flush=True)
+                continue
             print(f"➡️ 正在进入课程: {name[:40]}...", flush=True)
             try:
-                safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", name)
-                
+                if course_key not in state_db:
+                    legacy_state = state_db.pop(name, None)
+                    state_db[course_key] = (
+                        legacy_state
+                        if isinstance(legacy_state, dict)
+                        else {}
+                    )
+                course_state = state_db[course_key]
+                folder_name = (
+                    course_state.get("folder_name")
+                    or unique_course_folder_name(
+                        name, course_key, state_db
+                    )
+                )
+                course_state.update({
+                    "course_name": name,
+                    "course_url": canonicalize_url(link),
+                    "target_id": target["id"],
+                    "target_label": target["label"],
+                    "folder_name": folder_name,
+                })
+                course_record["folder_name"] = folder_name
+
                 base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
-                course_dir = os.path.join(base_dir, safe_course_name)
+                course_dir = os.path.join(base_dir, folder_name)
                 os.makedirs(course_dir, exist_ok=True)
                 
                 # 确保旧 state 也有新字段（兼容之前的用户数据）
-                if name not in state_db:
-                    state_db[name] = {}
-                course_state = state_db[name]
                 course_state.setdefault("hash", "")
                 course_state.setdefault("downloaded_files", [])
+                course_state.setdefault("downloaded_file_paths", {})
                 course_state.setdefault("md_generated", False)
                 course_state.setdefault("ics_generated", False)
                 course_state.setdefault("has_unclassified_files", False)
-                if course_state.get("download_tracking_version") != 2:
+                if course_state.get("download_tracking_version") != 3:
                     if course_state["downloaded_files"]:
                         print(
-                            "   🔄 下载状态规则升级：重新核验历史资源；"
-                            "硬盘已有文件不会重复写入。",
+                            "   🔄 下载状态升级：将网页资源重新绑定到本地文件；"
+                            "硬盘已有文件不会重复写入，缺失文件会自动补回。",
                             flush=True,
                         )
                     course_state["downloaded_files"] = []
-                    course_state["download_tracking_version"] = 2
+                    course_state["downloaded_file_paths"] = {}
+                    course_state["download_tracking_version"] = 3
 
                 old_snapshot = course_state.get("content_snapshot")
                 if not isinstance(old_snapshot, dict):
@@ -1480,7 +2096,12 @@ class WBLEScanner:
 
                 new_files, text_content, new_snapshot, extraction_ok = (
                     await deep_scan_course(
-                        self.page, link, course_dir, state_db, name
+                        self.page,
+                        link,
+                        course_dir,
+                        state_db,
+                        name,
+                        state_key=course_key,
                     )
                 )
 
@@ -1531,6 +2152,8 @@ class WBLEScanner:
                         )
                         updates_found.append({
                             "course": name,
+                            "course_key": course_key,
+                            "target": target["label"],
                             "summary": summary,
                             "files_count": new_files
                         })
@@ -1561,6 +2184,8 @@ class WBLEScanner:
                     )
                     updates_found.append({
                         "course": name,
+                        "course_key": course_key,
+                        "target": target["label"],
                         "summary": "课程文字未确认变化，但抓取到了新的课件文件。",
                         "files_count": new_files
                     })
@@ -1581,7 +2206,7 @@ class WBLEScanner:
                         print(f"   ⚠️ [自愈] MD 生成仍然失败，请检查 API Key 配置，下次会继续重试。", flush=True)
 
                 # ── 自愈机制 1.5：ICS 日历（仅当 MD 存在且 ICS 未成功时触发）────────
-                need_ics = not state_db[name].get("ics_generated", False)
+                need_ics = not course_state.get("ics_generated", False)
                 if need_ics and os.path.exists(md_path):
                     print(f"   🔄 [自愈] ICS 日历未同步，正在自动对齐更新...", flush=True)
                     ics_ok = await generate_ics_calendar(name, course_dir)
@@ -1589,7 +2214,7 @@ class WBLEScanner:
 
                 # ── 自愈机制 2：Others 重分类（状态感知 + 文件系统双保险）──
                 others_dir = os.path.join(course_dir, "Files", "Others")
-                has_others_flag = state_db[name].get("has_unclassified_files", False)
+                has_others_flag = course_state.get("has_unclassified_files", False)
                 others_files_exist = os.path.exists(others_dir) and bool([f for f in os.listdir(others_dir) if os.path.isfile(os.path.join(others_dir, f))])
                 if (has_others_flag or others_files_exist) and os.path.exists(others_dir):
                     stuck_files = [f for f in os.listdir(others_dir) if os.path.isfile(os.path.join(others_dir, f))]
@@ -1607,19 +2232,31 @@ class WBLEScanner:
                             new_dir = os.path.join(files_dir, category)
                             os.makedirs(new_dir, exist_ok=True)
                             new_path = os.path.join(new_dir, fname)
+                            old_relative = os.path.join("Others", fname)
+                            new_relative = os.path.join(category, fname)
                             if os.path.exists(new_path):
                                 # 目标路径已有同名文件（正确位置已存在），直接删掉 Others 里的重复副本
                                 os.remove(old_path)
+                                remap_tracked_download_path(
+                                    course_state,
+                                    old_relative,
+                                    new_relative,
+                                )
                                 print(f"      ✅ 目标已存在，清除 Others 重复副本: {fname}", flush=True)
                             else:
                                 os.rename(old_path, new_path)
+                                remap_tracked_download_path(
+                                    course_state,
+                                    old_relative,
+                                    new_relative,
+                                )
                                 print(f"      ✅ 重新分类: {fname} -> {category}", flush=True)
-                        state_db[name]["has_unclassified_files"] = not all_reclassified
+                        course_state["has_unclassified_files"] = not all_reclassified
                         # 如果 Others 文件夹已空，删掉保持整洁
                         if os.path.exists(others_dir) and not os.listdir(others_dir):
                             os.rmdir(others_dir)
                     else:
-                        state_db[name]["has_unclassified_files"] = False
+                        course_state["has_unclassified_files"] = False
 
             except Exception as e:
                 print(f"   ❌ 访问或处理课程失败: {e}", flush=True)
@@ -1633,8 +2270,11 @@ class WBLEScanner:
         config_mgr.save_state()
         
         if updates_found:
-            title = f"🚨 WBLE发现 {len(updates_found)} 门课有更新！"
-            desp = "以下是详细的更新汇总：\n\n"
+            title = (
+                f"🚨 {target['label']} 有 "
+                f"{len(updates_found)} 门课更新！"
+            )
+            desp = f"扫描目标：{target['label']}\n\n"
             for item in updates_found:
                 desp += f"### 📘 {item['course']}\n"
                 desp += f"> {item['summary']}\n"
@@ -1644,6 +2284,124 @@ class WBLEScanner:
             await send_wechat_notification(title, desp)
         
         print(f"✅ 本轮深潜任务完成。", flush=True)
+        return updates_found, course_records
+
+    async def run_scan_cycle(self):
+        """Scan every registered target and isolate failures per faculty."""
+        state_db = config_mgr.state
+        targets = get_dashboard_targets()
+        print(
+            f"\n[{datetime.now().strftime('%H:%M:%S')}] 🚀 "
+            f"开始多科系巡逻，共 {len(targets)} 个目标。",
+            flush=True,
+        )
+        updates_found = []
+        available_courses = []
+        successful_targets = []
+        failed_targets = []
+
+        for target in targets:
+            try:
+                target_updates, target_courses = (
+                    await self.scan_dashboard_target(target, state_db)
+                )
+                updates_found.extend(target_updates)
+                available_courses.extend(target_courses)
+                successful_targets.append(target)
+            except DashboardLoginRequired:
+                failed_targets.append({
+                    **target,
+                    "reason": "login_required",
+                })
+                print(
+                    f"⚠️ {target['label']} 需要登录，继续扫描其他目标。",
+                    flush=True,
+                )
+            except Exception as error:
+                failed_targets.append({
+                    **target,
+                    "reason": type(error).__name__,
+                })
+                print(
+                    f"⚠️ {target['label']} 扫描失败 "
+                    f"({type(error).__name__})，继续扫描其他目标。",
+                    flush=True,
+                )
+
+        # Replace records for successful targets. Retain the last known course
+        # list for targets that were temporarily unavailable.
+        successful_ids = {
+            target["id"] for target in successful_targets
+        }
+        previous_courses = config_mgr.get("available_courses", [])
+        if not isinstance(previous_courses, list):
+            previous_courses = []
+        retained_courses = []
+        for record in previous_courses:
+            if (
+                isinstance(record, dict)
+                and record.get("target_id") not in successful_ids
+            ):
+                retained_courses.append(record)
+
+        deduplicated_courses = {}
+        # A freshly scanned record wins if the same course URL is reachable
+        # through both a successful and a temporarily failed target.
+        for record in retained_courses + available_courses:
+            if isinstance(record, str):
+                deduplicated_courses.setdefault(record, record)
+            elif isinstance(record, dict) and record.get("key"):
+                deduplicated_courses[record["key"]] = record
+
+        report = {
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "targets_total": len(targets),
+            "targets_ok": len(successful_targets),
+            "targets_failed": failed_targets,
+            "courses_seen": len([
+                item for item in deduplicated_courses.values()
+                if isinstance(item, dict)
+            ]),
+            "updates_found": len(updates_found),
+        }
+        failed_by_id = {
+            target["id"]: target for target in failed_targets
+        }
+        successful_ids = {
+            target["id"] for target in successful_targets
+        }
+        updated_targets = []
+        for target in targets:
+            updated_target = dict(target)
+            updated_target["last_checked_at"] = report["finished_at"]
+            if target["id"] in successful_ids:
+                updated_target["last_status"] = "ok"
+                updated_target.pop("last_error", None)
+            else:
+                failure = failed_by_id.get(target["id"], {})
+                reason = failure.get("reason", "error")
+                updated_target["last_status"] = (
+                    "login_required"
+                    if reason == "login_required"
+                    else "error"
+                )
+                updated_target["last_error"] = reason
+            updated_targets.append(updated_target)
+        config_mgr.update({
+            "dashboard_targets": updated_targets,
+            "dashboard_targets_version": TARGETS_VERSION,
+            "available_courses": list(deduplicated_courses.values()),
+            "last_scan_report": report,
+        })
+        self.last_scan_report = report
+        config_mgr.state = state_db
+        config_mgr.save_state()
+
+        print(
+            f"✅ 多科系巡逻完成：{len(successful_targets)}/{len(targets)} "
+            f"个目标成功，{len(failed_targets)} 个失败。",
+            flush=True,
+        )
         return updates_found
 
     async def cleanup(self):

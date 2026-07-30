@@ -9,6 +9,7 @@ from core.config import ConfigManager, config_mgr
 from core.engine import (
     chunk_text_by_lines,
     diff_course_snapshots,
+    enable_chrome_password_manager,
     is_valid_course,
     normalize_ics_calendar,
     safe_download_filename,
@@ -17,6 +18,25 @@ from core.security import protect_secret, unprotect_secret
 
 
 class CoreBehaviorTests(unittest.TestCase):
+    def test_chrome_password_manager_preferences_are_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            preferences_path = os.path.join(
+                temp_dir, "Default", "Preferences"
+            )
+            os.makedirs(os.path.dirname(preferences_path))
+            with open(preferences_path, "w", encoding="utf-8") as file:
+                json.dump({"profile": {"name": "WBLE"}}, file)
+
+            self.assertTrue(enable_chrome_password_manager(temp_dir))
+            with open(preferences_path, encoding="utf-8") as file:
+                preferences = json.load(file)
+
+            self.assertTrue(preferences["credentials_enable_service"])
+            self.assertTrue(
+                preferences["profile"]["password_manager_enabled"]
+            )
+            self.assertEqual(preferences["profile"]["name"], "WBLE")
+
     def test_safe_download_filename(self):
         self.assertEqual(safe_download_filename("../../CON"), "_CON")
         self.assertEqual(safe_download_filename(r"..\L01?.pdf"), "L01_.pdf")

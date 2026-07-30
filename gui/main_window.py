@@ -8,13 +8,17 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QTextEdit, QFileDialog, QCheckBox, 
     QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem, QSlider, QComboBox,
     QMessageBox, QSplitter, QGraphicsOpacityEffect, QSizePolicy, QToolButton,
-    QAbstractItemView, QApplication
+    QAbstractItemView, QApplication, QScrollArea, QFrame
 )
 from PyQt6.QtGui import QIcon, QDesktopServices, QAction, QColor, QPalette, QPainter, QPainterPath, QMovie
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QSize, QPoint
 
 from core.config import config_mgr
-from core.engine import WBLEScanner
+from core.engine import (
+    TARGETS_VERSION,
+    WBLEScanner,
+    get_dashboard_targets,
+)
 from core.autostart import is_autostart_enabled, set_autostart_enabled
 from core.filesystem import move_to_recycle_bin
 
@@ -248,9 +252,9 @@ class MainWindow(QMainWindow):
         self.course_list.itemDoubleClicked.connect(self.open_course_folder)
         left_panel.addWidget(self.course_list)
         
-        btn_remove_course = QPushButton("Remove Selected")
-        btn_remove_course.clicked.connect(self.remove_selected_course)
-        left_panel.addWidget(btn_remove_course)
+        self.btn_remove_course = QPushButton("Remove Selected")
+        self.btn_remove_course.clicked.connect(self.remove_selected_course)
+        left_panel.addWidget(self.btn_remove_course)
         
         self.splitter.addWidget(self.left_panel_widget)
         
@@ -313,19 +317,34 @@ class MainWindow(QMainWindow):
         # Clean white terminal with soft gray text
         self.console.setStyleSheet("background-color: #f5f5f7; color: #515154; font-family: 'SF Pro Text', 'Segoe UI', Consolas; font-size: 13px; border-radius: 12px; padding: 10px; border: 1px solid #e5e5ea;")
         center_panel.addWidget(self.console, stretch=1)
-        
-        btn_scan = QPushButton("Force Scan Now")
-        btn_scan.setMinimumHeight(44)
-        btn_scan.setStyleSheet("background-color: #007aff; color: white; font-weight: 600; border-radius: 12px; font-size: 14px;")
-        btn_scan.clicked.connect(self.force_scan)
-        center_panel.addWidget(btn_scan)
+
+        self.btn_scan = QPushButton("Force Scan Now")
+        self.btn_scan.setMinimumHeight(44)
+        self.btn_scan.setStyleSheet("background-color: #007aff; color: white; font-weight: 600; border-radius: 12px; font-size: 14px;")
+        self.btn_scan.clicked.connect(self.force_scan)
+        center_panel.addWidget(self.btn_scan)
         
         self.splitter.addWidget(self.center_panel_widget)
         
         # === Right Panel: Settings ===
-        self.right_panel_widget = QWidget()
-        right_panel = QVBoxLayout(self.right_panel_widget)
-        right_panel.setContentsMargins(0, 0, 0, 0)
+        self.right_panel_widget = QScrollArea()
+        self.right_panel_widget.setWidgetResizable(True)
+        self.right_panel_widget.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_panel_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.right_panel_widget.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        self.right_panel_content = QWidget()
+        self.right_panel_content.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.right_panel_widget.setWidget(self.right_panel_content)
+        right_panel = QVBoxLayout(self.right_panel_content)
+        right_panel.setContentsMargins(0, 0, 8, 0)
         right_panel.setSpacing(12)
         # Header Layout
         header_layout = QHBoxLayout()
@@ -365,10 +384,10 @@ class MainWindow(QMainWindow):
         path_layout = QHBoxLayout()
         self.in_path = QLineEdit(config_mgr.get("download_dir"))
         self.in_path.setReadOnly(True)
-        btn_browse = QPushButton("Browse")
-        btn_browse.clicked.connect(self.browse_path)
+        self.btn_browse = QPushButton("Browse")
+        self.btn_browse.clicked.connect(self.browse_path)
         path_layout.addWidget(self.in_path)
-        path_layout.addWidget(btn_browse)
+        path_layout.addWidget(self.btn_browse)
         right_panel.addLayout(path_layout)
         
         # API Keys Section
@@ -487,6 +506,53 @@ class MainWindow(QMainWindow):
         if saved_interval in ["30 minutes", "1 hour", "4 hours", "12 hours"]:
             self.cb_interval.setCurrentText(saved_interval)
         right_panel.addWidget(self.cb_interval)
+
+        # Registered faculty/campus scan targets
+        lbl_targets = QLabel("Registered Faculties / Campuses")
+        lbl_targets.setStyleSheet(
+            "color: #86868b; font-size: 12px; margin-top: 10px; "
+            "font-weight: bold;"
+        )
+        right_panel.addWidget(lbl_targets)
+        self.target_list = QListWidget()
+        self.target_list.setObjectName("registeredTargetsList")
+        self.target_list.setMinimumHeight(88)
+        self.target_list.setMaximumHeight(132)
+        self.target_list.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.target_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.target_list.setStyleSheet("""
+            QListWidget#registeredTargetsList {
+                background: white;
+                border: 1px solid #d1d1d6;
+                border-radius: 10px;
+                padding: 4px;
+                outline: none;
+            }
+            QListWidget#registeredTargetsList::item {
+                min-height: 30px;
+                padding: 3px 8px;
+                margin: 1px 0;
+                border-radius: 6px;
+            }
+            QListWidget#registeredTargetsList::item:selected {
+                background: #e8f2ff;
+                color: #1d1d1f;
+            }
+        """)
+        self.target_list.setToolTip(
+            "每次 Force Scan 选择并登录一个科系，即会自动登记到这里。"
+        )
+        right_panel.addWidget(self.target_list)
+        self.btn_remove_target = QPushButton("Remove Selected Target")
+        self.btn_remove_target.clicked.connect(
+            self.remove_selected_target
+        )
+        right_panel.addWidget(self.btn_remove_target)
+        self.refresh_dashboard_targets()
         
         # File Size Limit
         lbl_file_limit = QLabel("Max File Limit (MB)")
@@ -511,12 +577,12 @@ class MainWindow(QMainWindow):
         right_panel.addWidget(self.chk_autostart)
         
         # Save Button
-        btn_save = QPushButton("Save Preferences")
-        btn_save.setMinimumHeight(44)
-        btn_save.setStyleSheet("background-color: #f5f5f7; color: #1d1d1f; border: 1px solid #d1d1d6; font-weight: 500; border-radius: 12px;")
-        btn_save.clicked.connect(self.save_settings)
+        self.btn_save = QPushButton("Save Preferences")
+        self.btn_save.setMinimumHeight(44)
+        self.btn_save.setStyleSheet("background-color: #f5f5f7; color: #1d1d1f; border: 1px solid #d1d1d6; font-weight: 500; border-radius: 12px;")
+        self.btn_save.clicked.connect(self.save_settings)
         right_panel.addStretch()
-        right_panel.addWidget(btn_save)
+        right_panel.addWidget(self.btn_save)
         
         self.splitter.addWidget(self.right_panel_widget)
         
@@ -666,17 +732,102 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app:
             app.quit()
+
+    def refresh_dashboard_targets(self):
+        if not hasattr(self, "target_list"):
+            return
+        self.target_list.clear()
+        for target in get_dashboard_targets():
+            status_icon = {
+                "ok": "✅",
+                "login_required": "🔐",
+                "error": "⚠️",
+            }.get(target.get("last_status"), "○")
+            item = QListWidgetItem(
+                f"{status_icon} {target['label']}"
+            )
+            details = [target["url"]]
+            if target.get("last_checked_at"):
+                details.append(
+                    f"Last checked: {target['last_checked_at']}"
+                )
+            if target.get("last_error"):
+                details.append(
+                    f"Status: {target['last_error']}"
+                )
+            item.setToolTip("\n".join(details))
+            item.setData(Qt.ItemDataRole.UserRole, target)
+            item.setSizeHint(QSize(0, 36))
+            self.target_list.addItem(item)
+
+    def remove_selected_target(self):
+        item = self.target_list.currentItem()
+        if not item:
+            return
+        target = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(target, dict):
+            return
+        reply = QMessageBox.question(
+            self,
+            "Remove Scan Target",
+            f"停止后台巡逻这个科系/校区吗？\n\n{target['label']}\n"
+            "已下载的课程文件和历史状态会保留。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        targets = [
+            candidate
+            for candidate in get_dashboard_targets()
+            if candidate["id"] != target["id"]
+        ]
+        available = config_mgr.get("available_courses", [])
+        available = [
+            record for record in available
+            if not (
+                isinstance(record, dict)
+                and record.get("target_id") == target["id"]
+            )
+        ]
+        config_mgr.update({
+            "dashboard_targets": targets,
+            "dashboard_targets_version": TARGETS_VERSION,
+            "dashboard_url": targets[-1]["url"] if targets else "",
+            "available_courses": available,
+        })
+        self.refresh_dashboard_targets()
+        self.refresh_course_list()
+        print(f"✅ 已停止巡逻目标: {target['label']}")
         
     def refresh_course_list(self):
         self.course_list.clear()
         available = config_mgr.get("available_courses", [])
         blacklist = config_mgr.get("blacklisted_courses", [])
+        blacklisted_keys = config_mgr.get("blacklisted_course_keys", [])
         
         # 加载最新的 state_db 获取状态
         states = config_mgr.state
         
-        for course in available:
-            if course not in blacklist:
+        for record in available:
+            if isinstance(record, dict):
+                course_key = record.get("key", "")
+                course = record.get("name", course_key)
+                target_label = record.get("target_label", "")
+            else:
+                course_key = str(record)
+                course = str(record)
+                target_label = ""
+                record = {
+                    "key": course_key,
+                    "name": course,
+                    "folder_name": re.sub(r'[\\/*?:"<>|]', "_", course),
+                }
+            if (
+                course not in blacklist
+                and course_key not in blacklisted_keys
+            ):
                 # Custom widget for list item
                 item_widget = QWidget()
                 h_layout = QHBoxLayout(item_widget)
@@ -684,13 +835,20 @@ class MainWindow(QMainWindow):
                 h_layout.setSpacing(12)
                 
                 # 使用自定义的省略号 Label，保证所有课程名只占一行且宽度自适应
-                lbl_name = ElidedLabel(course)
+                display_name = (
+                    f"{course} · {target_label}"
+                    if target_label else course
+                )
+                lbl_name = ElidedLabel(display_name)
+                lbl_name.setToolTip(display_name)
                 lbl_name.setStyleSheet("font-size: 13px; font-weight: 600; color: #1d1d1f; background: transparent;")
                 lbl_name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
                 lbl_name.setMinimumWidth(1) # 允许极限缩小
                 h_layout.addWidget(lbl_name, stretch=1)
                 
-                course_state = states.get(course, {})
+                course_state = states.get(
+                    course_key, states.get(course, {})
+                )
                 md_ok = course_state.get("md_generated", False)
                 ics_ok = course_state.get("ics_generated", False)
                 
@@ -721,7 +879,9 @@ class MainWindow(QMainWindow):
                 list_item = QListWidgetItem(self.course_list)
                 # 强制给定一个精确高度，完美包裹内部布局，解决框线越界问题
                 list_item.setSizeHint(QSize(0, 62))
-                list_item.setData(Qt.ItemDataRole.UserRole, course) # Store actual course name
+                list_item.setData(
+                    Qt.ItemDataRole.UserRole, record
+                )
                 
                 self.course_list.addItem(list_item)
                 self.course_list.setItemWidget(list_item, item_widget)
@@ -729,7 +889,17 @@ class MainWindow(QMainWindow):
     def remove_selected_course(self):
         item = self.course_list.currentItem()
         if item:
-            course = item.data(Qt.ItemDataRole.UserRole) or item.text()
+            record = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(record, dict):
+                course_key = record.get("key", "")
+                course = record.get("name", course_key)
+                folder_name = record.get("folder_name") or re.sub(
+                    r'[\\/*?:"<>|]', "_", course
+                )
+            else:
+                course = str(record or item.text())
+                course_key = course
+                folder_name = re.sub(r'[\\/*?:"<>|]', "_", course)
             
             # 确认弹窗
             reply = QMessageBox.question(
@@ -743,11 +913,10 @@ class MainWindow(QMainWindow):
                 return
 
             # 将本地文件夹移入回收站，避免误删后无法恢复。
-            safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
             base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
             base_dir = os.path.abspath(base_dir)
             course_dir = os.path.abspath(
-                os.path.join(base_dir, safe_course_name)
+                os.path.join(base_dir, folder_name)
             )
 
             if (
@@ -764,8 +933,9 @@ class MainWindow(QMainWindow):
             collisions = [
                 other
                 for other in config_mgr.get("available_courses", [])
-                if other != course
-                and re.sub(r'[\\/*?:"<>|]', "_", other) == safe_course_name
+                if isinstance(other, dict)
+                and other.get("key") != course_key
+                and other.get("folder_name") == folder_name
             ]
             if collisions:
                 QMessageBox.critical(
@@ -789,13 +959,21 @@ class MainWindow(QMainWindow):
                     )
                     return
 
-            blacklist = config_mgr.get("blacklisted_courses", [])
-            if course not in blacklist:
-                blacklist.append(course)
-                config_mgr.set("blacklisted_courses", blacklist)
+            blacklisted_keys = config_mgr.get(
+                "blacklisted_course_keys", []
+            )
+            if course_key not in blacklisted_keys:
+                blacklisted_keys.append(course_key)
+                config_mgr.set(
+                    "blacklisted_course_keys", blacklisted_keys
+                )
 
             state_db = config_mgr.state
-            if course in state_db:
+            if course_key in state_db:
+                del state_db[course_key]
+                config_mgr.state = state_db
+            elif course in state_db:
+                # Backward compatibility for a pre-migration course record.
                 del state_db[course]
                 config_mgr.state = state_db
             config_mgr.save_state()
@@ -804,10 +982,17 @@ class MainWindow(QMainWindow):
             print(f"✅ 已将课程移出监控列表: {course}")
 
     def open_course_folder(self, item):
-        course = item.data(Qt.ItemDataRole.UserRole) or item.text()
-        safe_course_name = re.sub(r'[\\/*?:"<>|]', "_", course)
+        record = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(record, dict):
+            course = record.get("name", record.get("key", "Course"))
+            folder_name = record.get("folder_name") or re.sub(
+                r'[\\/*?:"<>|]', "_", course
+            )
+        else:
+            course = str(record or item.text())
+            folder_name = re.sub(r'[\\/*?:"<>|]', "_", course)
         base_dir = config_mgr.get("download_dir", os.path.join(os.getcwd(), "WBLE_Downloads"))
-        course_dir = os.path.join(base_dir, safe_course_name)
+        course_dir = os.path.join(base_dir, folder_name)
         if os.path.exists(course_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(course_dir))
             print(f"📂 已在资源管理器中打开: {course}")
@@ -894,6 +1079,21 @@ class MainWindow(QMainWindow):
         self.console.moveCursor(self.console.textCursor().MoveOperation.End)
         self.console.insertPlainText(text)
         self.console.moveCursor(self.console.textCursor().MoveOperation.End)
+
+    def set_scan_ui_locked(self, locked):
+        """Prevent settings/course mutations while a scan owns the browser."""
+        enabled = not locked
+        self.left_panel_widget.setEnabled(enabled)
+        self.right_panel_widget.setEnabled(enabled)
+        self.btn_scan.setEnabled(enabled)
+        if locked:
+            self.btn_scan.setText("Scanning…")
+            self.btn_scan.setToolTip(
+                "扫描期间已锁定设置、课程删除和重复扫描操作。"
+            )
+        else:
+            self.btn_scan.setText("Force Scan Now")
+            self.btn_scan.setToolTip("")
         
     def force_scan(self):
         keys = config_mgr.get("api_keys", {})
@@ -934,6 +1134,7 @@ class MainWindow(QMainWindow):
         print("\n" + "="*40)
         print("🚀 收到手动强制扫描指令，准备启动...")
         self.scan_timer.stop()
+        self.set_scan_ui_locked(True)
         self.scan_task = asyncio.create_task(self.run_scan_wrapper(is_background=False))
 
     def update_timer_interval(self):
@@ -965,6 +1166,7 @@ class MainWindow(QMainWindow):
         print("\n" + "="*40)
         print("👻 [后台模式] 定时任务触发，开始静默巡逻...")
         self.scan_timer.stop()
+        self.set_scan_ui_locked(True)
         self.scan_task = asyncio.create_task(self.run_scan_wrapper(is_background=True))
 
     async def run_scan_wrapper(self, is_background=False):
@@ -972,20 +1174,72 @@ class MainWindow(QMainWindow):
             await self.scanner.init_browser(is_background=is_background)
             logged_in = await self.scanner.wait_for_login(is_background=is_background)
             if not logged_in:
+                self.refresh_dashboard_targets()
                 if is_background:
+                    failures = self.scanner.last_scan_report.get(
+                        "targets_failed", []
+                    )
+                    only_login = failures and all(
+                        failure.get("reason") == "login_required"
+                        for failure in failures
+                    )
                     self.tray_icon.showMessage(
-                        "WBLE 登录已过期",
-                        "请打开主界面并点击一次 Force Scan 重新授权。",
+                        (
+                            "WBLE 登录已过期"
+                            if only_login
+                            else "WBLE 后台验证失败"
+                        ),
+                        (
+                            "请打开主界面并点击一次 Force Scan "
+                            "重新授权所有标记为 🔐 的目标。"
+                            if only_login
+                            else "请检查网络；标记为 ⚠️ 的目标将在下轮重试。"
+                        ),
                         QSystemTrayIcon.MessageIcon.Warning,
                         8000
                     )
                 return
 
+            if not is_background:
+                # Login/password handling happens in the visible Chrome window.
+                # The actual scan is relaunched headlessly so user clicks,
+                # address-bar navigation, and page changes cannot corrupt it.
+                protected_login = (
+                    await self.scanner.switch_to_protected_scan_context()
+                )
+                if not protected_login:
+                    self.tray_icon.showMessage(
+                        "WBLE 扫描未启动",
+                        "安全扫描窗口未能恢复登录状态，请重新 Force Scan。",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        8000,
+                    )
+                    return
+
             updates = await self.scanner.run_scan_cycle()
+            self.refresh_dashboard_targets()
             self.refresh_course_list()
+            report = self.scanner.last_scan_report
+            failed_targets = report.get("targets_failed", [])
+            if failed_targets:
+                failed_names = ", ".join(
+                    target.get("label", "WBLE")
+                    for target in failed_targets
+                )
+                self.tray_icon.showMessage(
+                    "部分 WBLE 目标扫描失败",
+                    f"其他目标已继续完成。需要处理：{failed_names}",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    10000,
+                )
             if updates:
                 self.tray_icon.showMessage("WBLE 有新动态！", f"发现 {len(updates)} 门课有更新，课件已下载！", QSystemTrayIcon.MessageIcon.Information, 5000)
-            if not self.scan_success_animation.play() and not is_background:
+            scan_succeeded = report.get("targets_ok", 0) > 0
+            if (
+                scan_succeeded
+                and not self.scan_success_animation.play()
+                and not is_background
+            ):
                 # 打包遗漏动画资源时，手动扫描仍保留文字提示作为兜底。
                 self.toast.show_toast("🎉 WBLE 环境扫描完毕！")
         except Exception as e:
@@ -998,6 +1252,7 @@ class MainWindow(QMainWindow):
                 print(f"⚠️ 浏览器引擎清理失败: {cleanup_error}")
             finally:
                 # 无论成功、失败或登录过期，均从本轮结束时重新完整倒计时。
+                self.set_scan_ui_locked(False)
                 if not self.is_quitting:
                     self.update_timer_interval()
 

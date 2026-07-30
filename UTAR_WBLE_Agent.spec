@@ -1,11 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('utar_logo.png', '.'), ('scan_success.webp', '.')],
+    datas=[
+        ('utar_logo.png', '.'),
+        ('scan_success.webp', '.'),
+    ] + collect_data_files('certifi'),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
