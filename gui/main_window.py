@@ -779,11 +779,12 @@ class MainWindow(QMainWindow):
         lbl_interval.setStyleSheet("color: #86868b; font-size: 12px; margin-top: 10px; font-weight: bold;")
         right_panel.addWidget(lbl_interval)
         self.cb_interval = QComboBox()
-        self.cb_interval.addItems(["30 minutes", "1 hour", "4 hours", "12 hours"])
-        saved_interval = config_mgr.get("scan_interval_str", "30 minutes")
-        if saved_interval in ["30 minutes", "1 hour", "4 hours", "12 hours"]:
+        self.cb_interval.addItems(["2 minutes (Test)", "30 minutes", "1 hour", "4 hours", "12 hours"])
+        saved_interval = config_mgr.get("scan_interval_str", "1 hour")
+        if saved_interval in ["2 minutes (Test)", "30 minutes", "1 hour", "4 hours", "12 hours"]:
             self.cb_interval.setCurrentText(saved_interval)
         right_panel.addWidget(self.cb_interval)
+        self.cb_interval.currentTextChanged.connect(self.on_interval_changed)
 
         # Registered faculty/campus scan targets
         lbl_targets = QLabel("Registered Faculties / Campuses")
@@ -1110,7 +1111,13 @@ class MainWindow(QMainWindow):
         tray_menu.addAction(quit_action)
         
         self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_icon_activated)
         self.tray_icon.show()
+        
+    def on_tray_icon_activated(self, reason):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_and_activate()
 
     def show_and_activate(self):
         self.showNormal()
@@ -1568,16 +1575,21 @@ class MainWindow(QMainWindow):
         self.set_scan_ui_locked(True)
         self.scan_task = asyncio.create_task(self.run_scan_wrapper(is_background=False))
 
+    def on_interval_changed(self, text):
+        config_mgr.set("scan_interval_str", text)
+        self.update_timer_interval()
+
     def update_timer_interval(self):
-        interval_str = config_mgr.get("scan_interval_str", "30 minutes")
+        interval_str = config_mgr.get("scan_interval_str", "1 hour")
         mapping = {
+            "2 minutes (Test)": 2 * 60 * 1000,
             "30 minutes": 30 * 60 * 1000,
             "1 hour": 60 * 60 * 1000,
             "4 hours": 4 * 60 * 60 * 1000,
             "12 hours": 12 * 60 * 60 * 1000
         }
         if interval_str not in mapping:
-            interval_str = "30 minutes"
+            interval_str = "1 hour"
             config_mgr.set("scan_interval_str", interval_str)
         ms = mapping[interval_str]
         self.scan_timer.start(ms)

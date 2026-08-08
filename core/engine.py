@@ -1716,6 +1716,9 @@ class WBLEScanner:
             launch_options["ignore_default_args"] = [
                 "--enable-automation"
             ]
+        
+        # [Stealth] Inject anti-bot arguments
+        launch_options.setdefault("args", []).append("--disable-blink-features=AutomationControlled")
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -1743,6 +1746,10 @@ class WBLEScanner:
                 ) from chromium_error
 
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        
+        # [Stealth] Wipe webdriver property on all pages
+        await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
         browser_closed_event = asyncio.Event()
         self.browser_closed_event = browser_closed_event
         self.context.on(
@@ -2020,6 +2027,28 @@ class WBLEScanner:
                     flush=True,
                 )
                 return False
+
+            # --- START Auto-Bypass (Stealth) ---
+            try:
+                for p in self.context.pages:
+                    if "login" in p.url.casefold():
+                        # Auto-click reCAPTCHA
+                        iframe = p.frame_locator('iframe[title*="recaptcha" i]')
+                        checkbox = iframe.locator('.recaptcha-checkbox-border')
+                        if (await checkbox.count()) > 0 and await checkbox.is_visible():
+                            print("🤖 [Stealth] 发现 reCAPTCHA 验证码，尝试模拟人类静默点击...", flush=True)
+                            await checkbox.click(delay=250)
+                            await p.wait_for_timeout(2500)
+                        
+                        # Auto-click Login Button
+                        login_btn = p.locator('button[type="submit"], input[type="submit"], #loginbtn, .login-btn, button:has-text("Login")')
+                        if (await login_btn.count()) > 0 and await login_btn.is_visible():
+                            print("🤖 [Stealth] 尝试点击登录按钮...", flush=True)
+                            await login_btn.first.click(delay=150)
+                            await p.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"⚠️ [Stealth] 自动点击遭遇干扰: {e}", flush=True)
+            # --- END Auto-Bypass ---
 
             # 关键修复：监控 context 里所有标签页，而不只是初始页
             all_pages = self.context.pages
